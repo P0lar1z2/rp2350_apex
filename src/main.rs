@@ -14,7 +14,7 @@
 #![no_main]
 
 #[cfg(rp2350)]
-mod debug_hid;
+mod dynamic_clone;
 #[cfg(rp2350)]
 mod pio_host;
 
@@ -41,12 +41,6 @@ use rp235x_hal as hal;
 use rp2040_hal as hal;
 
 #[cfg(rp2350)]
-use debug_hid::{
-    DebugHid, DebugState, EVENT_BOOT, EVENT_BUS_RESET, EVENT_DECODER_TEST, EVENT_ENUM_FAILED,
-    EVENT_ENUM_OK, EVENT_ENUM_START, EVENT_HID_DECODED, EVENT_HID_REPORT, EVENT_LINE_STATE,
-    EVENT_PIO_LOOPBACK, EVENT_TRANSACTION_ERROR, EVENT_TX_STATE,
-};
-#[cfg(rp2350)]
 use hal::{
     clocks::Clock,
     gpio::{FunctionPio0, InputOverride, OutputDriveStrength, OutputSlewRate},
@@ -57,18 +51,15 @@ use pio::{
     Instruction, InstructionOperands, MovDestination, MovOperation, MovSource, SetDestination,
 };
 #[cfg(rp2350)]
-use pio_host::{BusSpeed, InResult, PioUsbHost, TransactionError};
-#[cfg(rp2350)]
-use t2::hid_device::KeyboardMouseHid;
+use pio_host::{BusSpeed, PioUsbHost, TransactionError};
 #[cfg(rp2350)]
 use t2::usb_host::{
-    DecodedReport, HidConfiguration, HidEndpoint, HidKind, SetupPacket, UsbPid,
-    parse_report_descriptor,
+    CloneIdentity, CloneProfile, CloneString, SetupPacket, parse_clone_configuration,
 };
 #[cfg(rp2350)]
 use usb_device::{
     bus::UsbBusAllocator,
-    device::{StringDescriptors, UsbDeviceBuilder, UsbVidPid},
+    device::{StringDescriptors, UsbDeviceBuilder, UsbRev, UsbVidPid},
 };
 
 // use bsp::entry;
@@ -426,8 +417,41 @@ fn main() -> ! {
             decoder_start_address,
         );
 
-        // Native Type-C port: a two-interface boot keyboard + boot mouse USB
-        // device, implemented directly on the Rust `usb-device` traits.
+        // Dynamic cloning must know the downstream identity before the native
+        // Type-C device connects. Wait for one HID device, snapshot every
+        // descriptor and only then construct the upstream USB device.
+        watchdog.start(hal::fugit::MicrosDurationU32::millis(5_000));
+        let clone_profile = loop {
+            watchdog.feed();
+            usb_dm.set_input_override(InputOverride::Normal);
+            usb_dp.set_input_override(InputOverride::Normal);
+            let dm_high = usb_dm.as_input().is_high().unwrap_or(false);
+            let dp_high = usb_dp.as_input().is_high().unwrap_or(false);
+            usb_dm.set_input_override(InputOverride::Invert);
+            usb_dp.set_input_override(InputOverride::Invert);
+            let speed = match (dm_high, dp_high) {
+                (false, true) => Some(BusSpeed::Full),
+                (true, false) => Some(BusSpeed::Low),
+                _ => None,
+            };
+            if let Some(speed) = speed {
+                host.configure_speed(speed);
+                host.reset_bus(&mut timer);
+                match enumerate_clone_device(&mut host, &timer) {
+                    Ok(profile) => break profile,
+                    Err(error) => warn!(
+                        "clone enumeration failed at stage {}: {:?}",
+                        error.stage,
+                        defmt::Debug2Format(&error.source)
+                    ),
+                }
+            }
+            let retry_at = timer.get_counter_low().wrapping_add(250_000);
+            while retry_at.wrapping_sub(timer.get_counter_low()) as i32 > 0 {
+                watchdog.feed();
+            }
+        };
+
         let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
             pac.USB,
             pac.USB_DPRAM,
@@ -435,356 +459,63 @@ fn main() -> ! {
             true,
             &mut pac.RESETS,
         ));
-        let mut hid = KeyboardMouseHid::new(&usb_bus);
-        let mut debug_hid = DebugHid::new(&usb_bus);
-        let mut usb_device = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x1209, 0x2350))
-            .strings(&[StringDescriptors::default()
-                .manufacturer("Pure Rust RP2350")
-                .product("PIO Host Keyboard + Mouse Bridge")
-                .serial_number("RP2350-USB-A")])
-            .unwrap()
-            .device_class(0)
-            .build();
+        let identity = &clone_profile.identity;
+        let mut clone =
+            dynamic_clone::DynamicHidClone::new(&usb_bus, &mut host, &timer, &clone_profile);
+        let mut strings = StringDescriptors::default();
+        if let Some(value) = identity.manufacturer.as_str() {
+            strings = strings.manufacturer(value);
+        }
+        if let Some(value) = identity.product.as_str() {
+            strings = strings.product(value);
+        }
+        if let Some(value) = identity.serial.as_str() {
+            strings = strings.serial_number(value);
+        }
+        let mut builder =
+            UsbDeviceBuilder::new(&usb_bus, UsbVidPid(identity.vendor_id, identity.product_id))
+                .device_class(identity.device_class)
+                .device_sub_class(identity.device_subclass)
+                .device_protocol(identity.device_protocol)
+                .device_release(identity.device_bcd)
+                .usb_rev(if identity.usb_bcd >= 0x0210 {
+                    UsbRev::Usb210
+                } else {
+                    UsbRev::Usb200
+                })
+                .self_powered(clone_profile.attributes & 0x40 != 0)
+                .supports_remote_wakeup(clone_profile.attributes & 0x20 != 0)
+                .max_packet_size_0(identity.ep0_size)
+                .unwrap()
+                .max_power(usize::from(clone_profile.max_power_2ma) * 2)
+                .unwrap();
+        if identity.manufacturer.as_str().is_some()
+            || identity.product.as_str().is_some()
+            || identity.serial.as_str().is_some()
+        {
+            builder = builder.strings(&[strings]).unwrap();
+        }
+        let mut usb_device = builder.build();
 
-        // WS2812 data order is GRB. Keep the values low so the tiny LED is
-        // comfortable to look at: red, green, blue, then off.
         const COLORS: [u32; 4] = [0x00_04_00, 0x04_00_00, 0x00_00_04, 0x00_00_00];
         let mut frame = 0u16;
         let mut color_index = 0usize;
-        let mut endpoints = [None; 4];
-        let mut expected_pid = [UsbPid::Data0; 4];
-        let mut next_poll = [0u16; 4];
-        let mut endpoint_error_streak = [0u8; 4];
-        let mut endpoint_count = 0usize;
-        let mut retry_enumeration_at = 0u16;
         let mut next_frame_tick = timer.get_counter_low();
-        let mut detected_speed = 0u8;
-        let mut debug_state = DebugState::new();
-        // Distinguishes a watchdog recovery (bit0 = timer) from a cold boot in
-        // the BOOT telemetry event.
-        let reboot_reason = unsafe { (*hal::pac::WATCHDOG::ptr()).reason().read().bits() as u8 };
-        debug_state.record(
-            EVENT_BOOT,
-            timer.get_counter_low(),
-            0,
-            0,
-            0,
-            0,
-            &[reboot_reason],
-        );
-        // The PIO busy-waits are individually bounded, but a wedged state
-        // machine or an unforeseen stall must never leave the board looking
-        // dead on both USB ports again. Worst-case legal loop iteration is a
-        // full enumeration retry (~1 s of NAK-bounded control transfers).
-        watchdog.start(hal::fugit::MicrosDurationU32::millis(5_000));
-        let mut sof_failed = false;
         loop {
             watchdog.feed();
-            usb_device.poll(&mut [&mut hid, &mut debug_hid]);
-            debug_state.try_send(&debug_hid);
-            match debug_hid.take_reboot_request() {
-                1 => hal::reboot::reboot(
+            usb_device.poll(&mut [&mut clone]);
+            clone.tick(frame);
+            if clone.disconnected() {
+                hal::reboot::reboot(
                     hal::reboot::RebootKind::Normal,
                     hal::reboot::RebootArch::Arm,
-                ),
-                2 => hal::reboot::reboot(
-                    hal::reboot::RebootKind::BootSel {
-                        picoboot_disabled: false,
-                        msd_disabled: false,
-                    },
-                    hal::reboot::RebootArch::Arm,
-                ),
-                _ => {}
-            }
-
-            if endpoint_count == 0 && frame == retry_enumeration_at {
-                // A full-speed device pulls D+ high; a low-speed device pulls
-                // D- high. Temporarily remove the RX inversion to inspect the
-                // physical line state, then restore it for the PIO programs.
-                usb_dm.set_input_override(InputOverride::Normal);
-                usb_dp.set_input_override(InputOverride::Normal);
-                let dm_high = usb_dm.as_input().is_high().unwrap_or(false);
-                let dp_high = usb_dp.as_input().is_high().unwrap_or(false);
-                usb_dm.set_input_override(InputOverride::Invert);
-                usb_dp.set_input_override(InputOverride::Invert);
-                let speed = match (dm_high, dp_high) {
-                    (false, true) => Some(BusSpeed::Full),
-                    (true, false) => Some(BusSpeed::Low),
-                    _ => None,
-                };
-                detected_speed = match speed {
-                    Some(BusSpeed::Full) => 1,
-                    Some(BusSpeed::Low) => 2,
-                    None => 0,
-                };
-                let pin_configuration = host.pio_pin_configuration();
-                debug_state.record(
-                    EVENT_LINE_STATE,
-                    timer.get_counter_low(),
-                    detected_speed,
-                    0,
-                    0,
-                    0,
-                    &[
-                        dm_high as u8,
-                        dp_high as u8,
-                        usb_dm.get_input_override() as u8,
-                        usb_dp.get_input_override() as u8,
-                        pin_configuration[0],
-                        pin_configuration[1],
-                        pin_configuration[2],
-                    ],
                 );
-
-                let result = if let Some(speed) = speed {
-                    debug_state.record(
-                        EVENT_ENUM_START,
-                        timer.get_counter_low(),
-                        detected_speed,
-                        1,
-                        0,
-                        0,
-                        &[],
-                    );
-                    host.configure_speed(speed);
-                    host.clear_rx_diagnostic();
-                    let decoder_test = host.decoder_test();
-                    let mut diagnostic = [0u8; 40];
-                    let diagnostic_length = host.rx_diagnostic(&mut diagnostic);
-                    debug_state.record(
-                        EVENT_DECODER_TEST,
-                        timer.get_counter_low(),
-                        detected_speed,
-                        0,
-                        decoder_test.err().map_or(0, transaction_error_code),
-                        0,
-                        &diagnostic[..diagnostic_length],
-                    );
-                    host.clear_rx_diagnostic();
-                    let loopback = host.loopback_test(&timer);
-                    let diagnostic_length = host.rx_diagnostic(&mut diagnostic);
-                    debug_state.record(
-                        EVENT_PIO_LOOPBACK,
-                        timer.get_counter_low(),
-                        detected_speed,
-                        0,
-                        loopback.err().map_or(0, transaction_error_code),
-                        0,
-                        &diagnostic[..diagnostic_length],
-                    );
-                    debug_state.record(
-                        EVENT_TX_STATE,
-                        timer.get_counter_low(),
-                        detected_speed,
-                        0,
-                        0,
-                        0,
-                        &host.tx_diagnostic(),
-                    );
-                    host.clear_rx_diagnostic();
-                    host.reset_bus(&mut timer);
-                    debug_state.record(
-                        EVENT_BUS_RESET,
-                        timer.get_counter_low(),
-                        detected_speed,
-                        0,
-                        0,
-                        0,
-                        &host.reset_diagnostic(),
-                    );
-                    enumerate_hid(&mut host, &timer)
-                } else {
-                    Err(EnumerationError {
-                        stage: 0,
-                        source: TransactionError::Timeout,
-                    })
-                };
-                match result {
-                    Ok(configuration) => {
-                        endpoint_count = 0;
-                        for endpoint in configuration.endpoints() {
-                            if endpoint_count < endpoints.len() {
-                                endpoints[endpoint_count] = Some(endpoint);
-                                expected_pid[endpoint_count] = UsbPid::Data0;
-                                next_poll[endpoint_count] = frame;
-                                endpoint_error_streak[endpoint_count] = 0;
-                                endpoint_count += 1;
-                            }
-                        }
-                        let mut endpoint_summary = [0u8; 24];
-                        for (index, endpoint) in
-                            endpoints[..endpoint_count].iter().flatten().enumerate()
-                        {
-                            let start = index * 6;
-                            endpoint_summary[start] = endpoint.endpoint;
-                            endpoint_summary[start + 1] = endpoint.interface;
-                            endpoint_summary[start + 2] = match endpoint.kind {
-                                HidKind::Keyboard => 1,
-                                HidKind::Mouse => 2,
-                                HidKind::Generic => 3,
-                            };
-                            endpoint_summary[start + 3] = !endpoint.decoder.is_empty() as u8;
-                            endpoint_summary[start + 4..start + 6]
-                                .copy_from_slice(&endpoint.report_descriptor_len.to_le_bytes());
-                        }
-                        debug_state.record(
-                            EVENT_ENUM_OK,
-                            timer.get_counter_low(),
-                            detected_speed,
-                            7,
-                            0,
-                            endpoint_count as u8,
-                            &endpoint_summary[..endpoint_count * 6],
-                        );
-                        info!("USB-A HID configured: {} endpoints", endpoint_count);
-                    }
-                    Err(error) => {
-                        let mut diagnostic = [0u8; 40];
-                        let diagnostic_length = host.rx_diagnostic(&mut diagnostic);
-                        debug_state.record(
-                            EVENT_ENUM_FAILED,
-                            timer.get_counter_low(),
-                            detected_speed,
-                            error.stage,
-                            transaction_error_code(error.source),
-                            0,
-                            &diagnostic[..diagnostic_length],
-                        );
-                        // The TX snapshot shows whether the last transmitted
-                        // packet made it out completely (queued vs FIFO left).
-                        debug_state.record(
-                            EVENT_TX_STATE,
-                            timer.get_counter_low(),
-                            detected_speed,
-                            error.stage,
-                            transaction_error_code(error.source),
-                            0,
-                            &host.tx_diagnostic(),
-                        );
-                        debug!("USB-A enumeration retry: {:?}", defmt::Debug2Format(&error));
-                        retry_enumeration_at = frame.wrapping_add(1000) & 0x07ff;
-                    }
-                }
             }
-
-            // A stuck transmitter would previously hang here forever; now it
-            // reports once per failure streak with the TX state machine's
-            // PC/IRQ/FIFO snapshot.
-            match host.send_sof(frame) {
-                Ok(()) => sof_failed = false,
-                Err(_) if !sof_failed => {
-                    sof_failed = true;
-                    debug_state.record(
-                        EVENT_TX_STATE,
-                        timer.get_counter_low(),
-                        detected_speed,
-                        0,
-                        transaction_error_code(TransactionError::Timeout),
-                        0,
-                        &host.tx_diagnostic(),
-                    );
-                }
-                Err(_) => {}
-            }
-
-            let active_endpoint_count = endpoint_count;
-            for index in 0..active_endpoint_count {
-                let Some(endpoint) = endpoints[index] else {
-                    continue;
-                };
-                if frame != next_poll[index] {
-                    continue;
-                }
-                next_poll[index] = frame.wrapping_add(u16::from(endpoint.interval_ms)) & 0x07ff;
-                let mut report = [0u8; 64];
-                match host.input(&timer, 1, endpoint.endpoint, &mut report) {
-                    Ok(InResult::Nak) => endpoint_error_streak[index] = 0,
-                    Ok(InResult::Data { length, pid }) if pid == expected_pid[index] => {
-                        endpoint_error_streak[index] = 0;
-                        expected_pid[index] = if pid == UsbPid::Data0 {
-                            UsbPid::Data1
-                        } else {
-                            UsbPid::Data0
-                        };
-                        if let Some(decoded) = forward_hid_report(&hid, endpoint, &report[..length])
-                        {
-                            let (payload, payload_len) =
-                                encode_decoded_debug(decoded, &report[..length]);
-                            debug_state.record(
-                                EVENT_HID_DECODED,
-                                timer.get_counter_low(),
-                                detected_speed,
-                                0,
-                                0,
-                                endpoint.endpoint,
-                                &payload[..payload_len],
-                            );
-                        } else {
-                            debug_state.record(
-                                EVENT_HID_REPORT,
-                                timer.get_counter_low(),
-                                detected_speed,
-                                0,
-                                0,
-                                endpoint.endpoint,
-                                &report[..length],
-                            );
-                        }
-                    }
-                    Ok(InResult::Data { .. }) => endpoint_error_streak[index] = 0,
-                    Err(TransactionError::Stall) => {
-                        debug_state.record(
-                            EVENT_TRANSACTION_ERROR,
-                            timer.get_counter_low(),
-                            detected_speed,
-                            0,
-                            transaction_error_code(TransactionError::Stall),
-                            endpoint.endpoint,
-                            &[],
-                        );
-                        endpoint_count = 0;
-                        retry_enumeration_at = frame.wrapping_add(1000) & 0x07ff;
-                        break;
-                    }
-                    Err(error) => {
-                        endpoint_error_streak[index] =
-                            endpoint_error_streak[index].saturating_add(1);
-                        // One transient failure is useful telemetry; emitting
-                        // every failed poll floods the debug endpoint and
-                        // hides the event that caused the streak. A real USB
-                        // device answers an interrupt IN with DATA or NAK, so
-                        // repeated silence means it was unplugged or replaced
-                        // and our address/endpoint state is stale.
-                        if endpoint_error_streak[index] == 1 {
-                            debug_state.record(
-                                EVENT_TRANSACTION_ERROR,
-                                timer.get_counter_low(),
-                                detected_speed,
-                                0,
-                                transaction_error_code(error),
-                                endpoint.endpoint,
-                                &[],
-                            );
-                        }
-                        if endpoint_error_streak[index] >= 8 {
-                            endpoint_count = 0;
-                            retry_enumeration_at = frame.wrapping_add(1) & 0x07ff;
-                            break;
-                        }
-                    }
-                }
-                usb_device.poll(&mut [&mut hid, &mut debug_hid]);
-                debug_state.try_send(&debug_hid);
-            }
-
             frame = (frame + 1) & 0x07ff;
             if frame.is_multiple_of(500) {
                 while !tx.write(COLORS[color_index] << 8) {}
                 color_index = (color_index + 1) % COLORS.len();
             }
-            // Keep SOF cadence tied to the 1 MHz hardware timer. Poll the
-            // native Type-C device while waiting, so PC control requests and
-            // HID IN transfers remain responsive.
             let now = timer.get_counter_low();
             let scheduled = next_frame_tick.wrapping_add(1000);
             next_frame_tick = if scheduled.wrapping_sub(now) as i32 > 0 {
@@ -793,20 +524,9 @@ fn main() -> ! {
                 now.wrapping_add(1000)
             };
             while next_frame_tick.wrapping_sub(timer.get_counter_low()) as i32 > 0 {
-                usb_device.poll(&mut [&mut hid, &mut debug_hid]);
-                debug_state.try_send(&debug_hid);
+                usb_device.poll(&mut [&mut clone]);
             }
         }
-    }
-}
-
-#[cfg(rp2350)]
-const fn transaction_error_code(error: TransactionError) -> u8 {
-    match error {
-        TransactionError::Timeout => 1,
-        TransactionError::Malformed => 2,
-        TransactionError::Stall => 3,
-        TransactionError::BufferTooSmall => 4,
     }
 }
 
@@ -818,13 +538,12 @@ struct EnumerationError {
 }
 
 #[cfg(rp2350)]
-fn enumerate_hid<D: hal::timer::TimerDevice>(
+fn enumerate_clone_device<D: hal::timer::TimerDevice>(
     host: &mut PioUsbHost,
     timer: &hal::Timer<D>,
-) -> Result<HidConfiguration, EnumerationError> {
-    // First eight bytes reveal endpoint-zero's maximum packet size.
+) -> Result<CloneProfile, EnumerationError> {
     let mut device_head = [0u8; 8];
-    let length = host
+    if host
         .control_read(
             timer,
             0,
@@ -838,33 +557,58 @@ fn enumerate_hid<D: hal::timer::TimerDevice>(
             8,
             &mut device_head,
         )
-        .map_err(|source| EnumerationError { stage: 1, source })?;
-    if length != 8 || !matches!(device_head[7], 8 | 16 | 32 | 64) {
+        .map_err(|source| EnumerationError { stage: 1, source })?
+        != 8
+        || !matches!(device_head[7], 8 | 16 | 32 | 64)
+    {
         return Err(EnumerationError {
             stage: 1,
             source: TransactionError::Malformed,
         });
     }
     let ep0_size = usize::from(device_head[7]);
-
     host.control_write(
         timer,
         0,
         SetupPacket {
             request_type: 0,
-            request: 5, // SET_ADDRESS
+            request: 5,
             value: 1,
             index: 0,
             length: 0,
         },
     )
     .map_err(|source| EnumerationError { stage: 2, source })?;
-
-    // USB 2.0 requires a recovery interval after SET_ADDRESS before the host
-    // uses the new address. Wireless receivers often need nearly the full
-    // allowance while their internal hub/HID MCU updates endpoint zero.
     let address_set_at = timer.get_counter_low();
     while timer.get_counter_low().wrapping_sub(address_set_at) < 2_000 {}
+
+    let mut device_descriptor = [0u8; 18];
+    if host
+        .control_read(
+            timer,
+            1,
+            SetupPacket {
+                request_type: 0x80,
+                request: 6,
+                value: 0x0100,
+                index: 0,
+                length: 18,
+            },
+            ep0_size,
+            &mut device_descriptor,
+        )
+        .map_err(|source| EnumerationError { stage: 3, source })?
+        != 18
+    {
+        return Err(EnumerationError {
+            stage: 3,
+            source: TransactionError::Malformed,
+        });
+    }
+    let identity = CloneIdentity::parse(&device_descriptor).map_err(|_| EnumerationError {
+        stage: 3,
+        source: TransactionError::Malformed,
+    })?;
 
     let mut config_head = [0u8; 9];
     if host
@@ -881,22 +625,22 @@ fn enumerate_hid<D: hal::timer::TimerDevice>(
             ep0_size,
             &mut config_head,
         )
-        .map_err(|source| EnumerationError { stage: 3, source })?
+        .map_err(|source| EnumerationError { stage: 4, source })?
         != 9
     {
         return Err(EnumerationError {
-            stage: 3,
+            stage: 4,
             source: TransactionError::Malformed,
         });
     }
     let total = usize::from(u16::from_le_bytes([config_head[2], config_head[3]]));
     if !(9..=256).contains(&total) {
         return Err(EnumerationError {
-            stage: 3,
+            stage: 4,
             source: TransactionError::BufferTooSmall,
         });
     }
-    let mut config_bytes = [0u8; 256];
+    let mut config = [0u8; 256];
     let actual = host
         .control_read(
             timer,
@@ -909,153 +653,134 @@ fn enumerate_hid<D: hal::timer::TimerDevice>(
                 length: total as u16,
             },
             ep0_size,
-            &mut config_bytes[..total],
+            &mut config[..total],
         )
         .map_err(|source| EnumerationError { stage: 4, source })?;
-    let mut configuration = t2::usb_host::parse_hid_configuration(&config_bytes[..actual])
-        .map_err(|_| EnumerationError {
+    let mut profile =
+        parse_clone_configuration(identity, &config[..actual]).map_err(|_| EnumerationError {
             stage: 4,
             source: TransactionError::Malformed,
         })?;
-    if configuration.is_empty() {
-        return Err(EnumerationError {
-            stage: 4,
-            source: TransactionError::Malformed,
-        });
-    }
 
     host.control_write(
         timer,
         1,
         SetupPacket {
             request_type: 0,
-            request: 9, // SET_CONFIGURATION
-            value: u16::from(configuration.configuration_value),
+            request: 9,
+            value: u16::from(profile.configuration_value),
             index: 0,
             length: 0,
         },
     )
     .map_err(|source| EnumerationError { stage: 5, source })?;
 
-    // Every HID interface owns its Report Descriptor and decoder. This state
-    // lives in the endpoint record and is discarded on disconnect/re-enumeration.
-    for endpoint in configuration.endpoints_mut() {
-        let report_len = usize::from(endpoint.report_descriptor_len);
-        if report_len == 0 || report_len > 256 {
-            continue;
+    for interface in profile.interfaces_mut() {
+        if interface.report_descriptor_len == 0
+            || interface.report_descriptor_len > interface.report_descriptor.len()
+        {
+            return Err(EnumerationError {
+                stage: 6,
+                source: TransactionError::BufferTooSmall,
+            });
         }
-        let mut report_descriptor = [0u8; 256];
-        if let Ok(actual) = host.control_read(
-            timer,
-            1,
-            SetupPacket {
-                request_type: 0x81,
-                request: 6,
-                value: 0x2200,
-                index: u16::from(endpoint.interface),
-                length: report_len as u16,
-            },
-            ep0_size,
-            &mut report_descriptor[..report_len],
-        ) {
-            endpoint.decoder = parse_report_descriptor(&report_descriptor[..actual]);
-        }
-    }
-
-    // Boot-capable interfaces support SET_PROTOCOL. Prefer Report Protocol
-    // when its descriptor parsed successfully; retain Boot Protocol only as a
-    // compatibility fallback for malformed legacy devices.
-    for endpoint in configuration.endpoints() {
-        if matches!(endpoint.kind, HidKind::Keyboard | HidKind::Mouse) {
-            let _ = host.control_write(
+        let wanted = interface.report_descriptor_len;
+        let actual = host
+            .control_read(
                 timer,
                 1,
                 SetupPacket {
-                    request_type: 0x21,
-                    request: 0x0b, // HID SET_PROTOCOL
-                    value: u16::from(!endpoint.decoder.is_empty()),
-                    index: u16::from(endpoint.interface),
-                    length: 0,
+                    request_type: 0x81,
+                    request: 6,
+                    value: 0x2200,
+                    index: u16::from(interface.original_number),
+                    length: wanted as u16,
                 },
-            );
-        }
+                ep0_size,
+                &mut interface.report_descriptor[..wanted],
+            )
+            .map_err(|source| EnumerationError { stage: 6, source })?;
+        interface.report_descriptor_len = actual;
     }
-    Ok(configuration)
+
+    let language = read_string_language(host, timer, ep0_size).unwrap_or(0x0409);
+    profile.identity.manufacturer = read_clone_string(
+        host,
+        timer,
+        ep0_size,
+        language,
+        profile.identity.manufacturer_index,
+    );
+    profile.identity.product = read_clone_string(
+        host,
+        timer,
+        ep0_size,
+        language,
+        profile.identity.product_index,
+    );
+    profile.identity.serial = read_clone_string(
+        host,
+        timer,
+        ep0_size,
+        language,
+        profile.identity.serial_index,
+    );
+    Ok(profile)
 }
 
 #[cfg(rp2350)]
-fn forward_hid_report<B: usb_device::bus::UsbBus>(
-    hid: &KeyboardMouseHid<'_, B>,
-    endpoint: HidEndpoint,
-    report: &[u8],
-) -> Option<DecodedReport> {
-    if let Some(decoded) = endpoint.decoder.decode(report) {
-        match decoded {
-            DecodedReport::Keyboard(state) => {
-                let _ = hid.push_keyboard_state(&state);
-            }
-            DecodedReport::Mouse(state) => {
-                let _ = hid.push_mouse_extended(
-                    state.buttons,
-                    state.x,
-                    state.y,
-                    state.wheel,
-                    state.pan,
-                );
-            }
-            DecodedReport::Consumer(usage) => {
-                let _ = hid.push_consumer(usage);
-            }
-        }
-        return Some(decoded);
-    }
-
-    // If an old boot device supplied no usable descriptor, preserve the
-    // fixed-format path instead of dropping its input entirely.
-    match endpoint.kind {
-        HidKind::Keyboard if report.len() >= 8 => {
-            let mut boot = [0u8; 8];
-            boot.copy_from_slice(&report[..8]);
-            let _ = hid.push_keyboard(&boot);
-        }
-        HidKind::Mouse if report.len() >= 3 => {
-            let wheel = report.get(3).copied().unwrap_or(0) as i8;
-            let _ = hid.push_mouse(report[0], report[1] as i8, report[2] as i8, wheel);
-        }
-        _ => {}
-    }
-    None
+fn read_string_language<D: hal::timer::TimerDevice>(
+    host: &mut PioUsbHost,
+    timer: &hal::Timer<D>,
+    ep0_size: usize,
+) -> Option<u16> {
+    let mut descriptor = [0u8; 4];
+    let actual = host
+        .control_read(
+            timer,
+            1,
+            SetupPacket {
+                request_type: 0x80,
+                request: 6,
+                value: 0x0300,
+                index: 0,
+                length: 4,
+            },
+            ep0_size,
+            &mut descriptor,
+        )
+        .ok()?;
+    (actual >= 4).then(|| u16::from_le_bytes([descriptor[2], descriptor[3]]))
 }
 
 #[cfg(rp2350)]
-fn encode_decoded_debug(decoded: DecodedReport, raw: &[u8]) -> ([u8; 40], usize) {
-    let mut payload = [0u8; 40];
-    let normalized_len = match decoded {
-        DecodedReport::Keyboard(state) => {
-            payload[0] = 1;
-            payload[1] = state.modifiers;
-            payload[2..16].copy_from_slice(&state.keys);
-            16
-        }
-        DecodedReport::Mouse(state) => {
-            payload[0] = 2;
-            payload[1] = state.buttons;
-            payload[2..4].copy_from_slice(&state.x.to_le_bytes());
-            payload[4..6].copy_from_slice(&state.y.to_le_bytes());
-            payload[6] = state.wheel as u8;
-            payload[7] = state.pan as u8;
-            8
-        }
-        DecodedReport::Consumer(usage) => {
-            payload[0] = 3;
-            payload[1..3].copy_from_slice(&usage.to_le_bytes());
-            3
-        }
+fn read_clone_string<D: hal::timer::TimerDevice>(
+    host: &mut PioUsbHost,
+    timer: &hal::Timer<D>,
+    ep0_size: usize,
+    language: u16,
+    index: u8,
+) -> CloneString {
+    if index == 0 {
+        return CloneString::empty();
+    }
+    let mut descriptor = [0u8; 128];
+    let Ok(actual) = host.control_read(
+        timer,
+        1,
+        SetupPacket {
+            request_type: 0x80,
+            request: 6,
+            value: 0x0300 | u16::from(index),
+            index: language,
+            length: descriptor.len() as u16,
+        },
+        ep0_size,
+        &mut descriptor,
+    ) else {
+        return CloneString::empty();
     };
-    let raw_len = raw.len().min(payload.len() - normalized_len - 1);
-    payload[normalized_len] = raw_len as u8;
-    payload[normalized_len + 1..normalized_len + 1 + raw_len].copy_from_slice(&raw[..raw_len]);
-    (payload, normalized_len + 1 + raw_len)
+    CloneString::from_usb_descriptor(&descriptor[..actual])
 }
 
 /// Program metadata for `picotool info`

@@ -452,6 +452,7 @@ impl PioUsbHost {
         let mut actual = 0usize;
         let mut expected = UsbPid::Data1;
         let mut attempts = 0u8;
+        let mut short_packet = false;
         while actual < wanted && attempts < 100 {
             let mut packet = [0u8; 64];
             // A NAK, a missed response and a corrupted response are all
@@ -488,12 +489,13 @@ impl PioUsbHost {
                         UsbPid::Data1
                     };
                     if length < max_packet_size {
+                        short_packet = true;
                         break;
                     }
                 }
             }
         }
-        if actual < wanted {
+        if actual < wanted && !short_packet {
             return Err(TransactionError::Timeout);
         }
         // Status stage for a device-to-host control transfer is a DATA1 ZLP.
@@ -526,6 +528,67 @@ impl PioUsbHost {
         setup: t2::usb_host::SetupPacket,
     ) -> Result<(), TransactionError> {
         self.setup(timer, address, &setup.to_bytes())?;
+        for _ in 0..100 {
+            let mut status = [0u8; 1];
+            match self.input(timer, address, 0, &mut status) {
+                Ok(InResult::Nak) => wait_us(timer, 1_000),
+                Ok(InResult::Data {
+                    length: 0,
+                    pid: UsbPid::Data1,
+                }) => return Ok(()),
+                Ok(InResult::Data { .. }) => return Err(TransactionError::Malformed),
+                Err(TransactionError::Stall) => return Err(TransactionError::Stall),
+                Err(_) => wait_us(timer, 1_000),
+            }
+        }
+        Err(TransactionError::Timeout)
+    }
+
+    /// Complete a host-to-device control transfer with an OUT data stage.
+    /// HID SET_REPORT uses this path for LEDs, feature reports and vendor
+    /// control channels such as Logitech HID++.
+    #[unsafe(link_section = ".data.usb_host")]
+    #[inline(never)]
+    pub fn control_write_data<D: TimerDevice>(
+        &mut self,
+        timer: &Timer<D>,
+        address: u8,
+        setup: t2::usb_host::SetupPacket,
+        max_packet_size: usize,
+        data: &[u8],
+    ) -> Result<(), TransactionError> {
+        if usize::from(setup.length) != data.len() || max_packet_size == 0 {
+            return Err(TransactionError::Malformed);
+        }
+        self.setup(timer, address, &setup.to_bytes())?;
+        let mut offset = 0usize;
+        let mut pid = UsbPid::Data1;
+        while offset < data.len() {
+            let end = (offset + max_packet_size).min(data.len());
+            let mut sent = false;
+            for _ in 0..100 {
+                match self.output(timer, address, 0, pid, &data[offset..end]) {
+                    Ok(()) => {
+                        sent = true;
+                        break;
+                    }
+                    Err(TransactionError::Stall) => return Err(TransactionError::Stall),
+                    Err(_) => wait_us(timer, 1_000),
+                }
+            }
+            if !sent {
+                return Err(TransactionError::Timeout);
+            }
+            offset = end;
+            pid = if pid == UsbPid::Data1 {
+                UsbPid::Data0
+            } else {
+                UsbPid::Data1
+            };
+        }
+
+        // Status stage for a host-to-device control transfer is a DATA1 ZLP
+        // returned by the device.
         for _ in 0..100 {
             let mut status = [0u8; 1];
             match self.input(timer, address, 0, &mut status) {

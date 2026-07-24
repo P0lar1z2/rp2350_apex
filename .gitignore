@@ -118,3 +118,7 @@ $RECYCLE.BIN/
 # Local upstream source used only for implementation comparison. The firmware
 # has no source, build, or runtime dependency on Pico-PIO-USB.
 reference/Pico-PIO-USB/
+
+# Python monitor/tool caches.
+__pycache__/
+*.py[cod]

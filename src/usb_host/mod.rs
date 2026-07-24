@@ -5,6 +5,7 @@
 
 mod crc;
 mod descriptor;
+mod device_clone;
 mod hid_report;
 mod packet;
 mod tx;
@@ -13,6 +14,11 @@ pub use crc::{crc5_token, crc16_step, crc16_usb};
 pub use descriptor::{
     DescriptorError, HidConfiguration, HidEndpoint, HidKind, MAX_HID_INTERFACES,
     parse_hid_configuration,
+};
+pub use device_clone::{
+    CloneDescriptorError, CloneEndpoint, CloneIdentity, CloneInterface, CloneProfile, CloneString,
+    MAX_CLONE_INTERFACES, MAX_CLONE_STRING_BYTES, MAX_REPORT_DESCRIPTOR_BYTES,
+    parse_clone_configuration,
 };
 pub use hid_report::{
     DecodedReport, KEY_BITMAP_BYTES, KeyboardState, MouseState, ReportDecoder,
