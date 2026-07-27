@@ -51,7 +51,7 @@ pub struct Trigger {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Repeat {
     Once,
-    Count(u16),
+    Count(RandomU16),
     WhileActive,
     Forever,
 }
@@ -159,6 +159,7 @@ struct Frame {
     index: usize,
     repeat: Repeat,
     completed: u16,
+    sampled_count: u16,
 }
 
 impl Frame {
@@ -168,6 +169,7 @@ impl Frame {
             index: 0,
             repeat: Repeat::Once,
             completed: 0,
+            sampled_count: 0,
         }
     }
 
@@ -177,6 +179,7 @@ impl Frame {
             index: 0,
             repeat,
             completed: 0,
+            sampled_count: 0,
         }
     }
 }
@@ -602,7 +605,7 @@ fn run_program(
         }
         let frame_index = state.depth - 1;
         if state.frames[frame_index].index >= state.frames[frame_index].steps.len() {
-            if repeat_frame(state, frame_index) {
+            if repeat_frame(state, frame_index, rng) {
                 if frame_index == 0 && program.alternate_on_repeat {
                     state.frames[0].steps = state.next_steps(program);
                 }
@@ -642,7 +645,7 @@ fn run_program(
                 *pending_pan = pending_pan.saturating_add(rng.i16(pan));
             }
             Step::Repeat { repeat, steps } => {
-                if state.depth < MAX_LOOP_DEPTH && !matches!(repeat, Repeat::Count(0)) {
+                if state.depth < MAX_LOOP_DEPTH {
                     state.frames[state.depth] = Frame::new(steps, repeat);
                     state.depth += 1;
                 }
@@ -666,12 +669,17 @@ fn set_owned_key(state: &mut ProgramState, usage: u8, down: bool) {
     }
 }
 
-fn repeat_frame(state: &mut ProgramState, index: usize) -> bool {
+fn repeat_frame(state: &mut ProgramState, index: usize, rng: &mut MacroRng) -> bool {
     let frame = &mut state.frames[index];
     frame.completed = frame.completed.saturating_add(1);
     let repeat = match frame.repeat {
         Repeat::Once => false,
-        Repeat::Count(count) => frame.completed < count,
+        Repeat::Count(count) => {
+            if frame.sampled_count == 0 {
+                frame.sampled_count = rng.u16(count).max(1);
+            }
+            frame.completed < frame.sampled_count
+        }
         Repeat::WhileActive => state.active,
         Repeat::Forever => true,
     };
@@ -741,7 +749,7 @@ mod tests {
         },
         repeat: Repeat::Once,
         steps: &[Step::Repeat {
-            repeat: Repeat::Count(3),
+            repeat: Repeat::Count(RandomU16::Fixed(3)),
             steps: MOVE_LOOP,
         }],
         alternate_steps: None,
@@ -966,7 +974,7 @@ mod tests {
                     },
                     repeat: Repeat::Once,
                     steps: &[Step::Repeat {
-                        repeat: Repeat::Count(3),
+                        repeat: Repeat::Count(RandomU16::Fixed(3)),
                         steps: &[
                             Step::MouseWheel {
                                 vertical: RandomI16::Fixed(-1),
@@ -987,6 +995,52 @@ mod tests {
             assert_eq!(engine.take_mouse_output().unwrap().wheel, -1);
         }
         engine.tick(3_000);
+        assert!(!engine.has_mouse_output());
+    }
+
+    #[test]
+    fn random_repeat_count_is_sampled_once_per_loop() {
+        static RANDOM_REPEAT_CONFIG: Config = Config {
+            seed: 1,
+            always_mask: &[],
+            layers: &[Layer {
+                group: 0,
+                default_enabled: true,
+                activation: None,
+                programs: &[Program {
+                    trigger: Trigger {
+                        chord: &[Input::MouseButton(4)],
+                        behavior: TriggerBehavior::Press,
+                        mask: Mask::None,
+                    },
+                    repeat: Repeat::Once,
+                    steps: &[Step::Repeat {
+                        repeat: Repeat::Count(RandomU16::Uniform { min: 2, max: 4 }),
+                        steps: &[
+                            Step::MouseWheel {
+                                vertical: RandomI16::Fixed(1),
+                                pan: RandomI16::Fixed(0),
+                            },
+                            Step::WaitMs(RandomU16::Fixed(1)),
+                        ],
+                    }],
+                    alternate_steps: None,
+                    alternate_on_repeat: false,
+                }],
+            }],
+        };
+        let mut engine = MacroEngine::new(&RANDOM_REPEAT_CONFIG, 0);
+        engine.observe(mouse(1 << 3));
+        let mut reports = 0;
+        for now_us in (0..10_000).step_by(1_000) {
+            engine.tick(now_us);
+            if let Some(output) = engine.take_mouse_output()
+                && output.wheel == 1
+            {
+                reports += 1;
+            }
+        }
+        assert!((2..=4).contains(&reports));
         assert!(!engine.has_mouse_output());
     }
 

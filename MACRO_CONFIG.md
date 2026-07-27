@@ -59,8 +59,9 @@ input.
 
 ## Sequence and loops
 
-The program-level `repeat` accepts `"once"`, `"while_active"`, `"forever"`, or
-a positive integer. A local loop is another sequence step:
+The program-level `repeat` accepts `"once"`, `"while_active"`, `"forever"`, a
+positive integer, or an inclusive random range. A local loop uses the same
+values:
 
 ```toml
 sequence = [
@@ -70,6 +71,17 @@ sequence = [
   ] },
 ]
 ```
+
+```toml
+repeat = { min = 2, max = 4 }
+sequence = [
+  { do = "repeat", repeat = { min = 3, max = 6 }, sequence = [
+    { do = "mouse.move", x = 0, y = 2 },
+  ] },
+]
+```
+
+A random repeat count is sampled once when that loop runs, not once per step.
 
 When `alternate_sequence` is present, trigger edges alternate between
 `sequence` and `alternate_sequence`, starting with `sequence`:
@@ -97,11 +109,12 @@ Available steps:
 { do = "mouse.button_up", button = "left" }
 { do = "mouse.move", x = -1, y = 3 }
 { do = "mouse.wheel", vertical = 1, pan = 0 }
-{ do = "mouse.wheel_burst", vertical = -1, duration_ms = 8 }
+{ do = "mouse.wheel_burst", vertical = -1, duration_ms = { min = 7, max = 10 } }
 ```
 
 `mouse.wheel` emits one wheel delta. `mouse.wheel_burst` emits the delta once
-per millisecond for `duration_ms`; its duration must be positive. The upstream
+per millisecond for `duration_ms`; its fixed value or range must be positive.
+The burst duration is sampled once at the start of each burst. The upstream
 HID interrupt endpoint advertises a 1 ms poll interval so these reports can be
 consumed separately by the host.
 
@@ -137,6 +150,10 @@ inclusive range:
 ```toml
 { do = "wait", ms = { min = 16, max = 22 } }
 { do = "mouse.move", x = { min = -1, max = 1 }, y = { min = 1, max = 3 } }
+{ do = "mouse.wheel_burst", vertical = -1, duration_ms = { min = 7, max = 10 } }
+{ do = "repeat", repeat = { min = 2, max = 4 }, sequence = [
+  { do = "mouse.wheel", vertical = 1 },
+] }
 ```
 
 The generator is deterministic and non-cryptographic. `random.seed` is mixed

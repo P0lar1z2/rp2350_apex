@@ -56,7 +56,7 @@ id = "randomized_recoil"
 repeat = "while_active"
 sequence = [
   { do = "wait", ms = { min = 11, max = 15 } },
-  { do = "repeat", repeat = 3, sequence = [
+  { do = "repeat", repeat = { min = 2, max = 4 }, sequence = [
     { do = "mouse.move", x = { min = -1, max = 1 }, y = { min = 1, max = 3 } },
     { do = "wait", ms = { min = 12, max = 17 } },
   ] },
@@ -85,7 +85,7 @@ alternate_on_repeat = true
 sequence = [
   { do = "keyboard.key_down", key = "key.a" },
   { do = "wait", ms = { min = 16, max = 24 } },
-  { do = "mouse.wheel_burst", vertical = -1, duration_ms = 32 },
+  { do = "mouse.wheel_burst", vertical = -1, duration_ms = { min = 30, max = 34 } },
   { do = "wait", ms = { min = 45, max = 55 } },
   { do = "keyboard.key_down", key = "key.w" },
   { do = "wait", ms = { min = 65, max = 80 } },
@@ -94,10 +94,10 @@ sequence = [
   { do = "keyboard.key_up", key = "key.w" },
   { do = "wait", ms = { min = 4, max = 8 } },
   { do = "keyboard.key_up", key = "key.a" },
-  { do = "mouse.wheel_burst", vertical = 1, duration_ms = 48 },
+  { do = "mouse.wheel_burst", vertical = 1, duration_ms = { min = 46, max = 50 } },
   { do = "wait", ms = { min = 30, max = 42 } },
   { do = "keyboard.key_down", key = "key.s" },
-  { do = "mouse.wheel_burst", vertical = 1, duration_ms = 48 },
+  { do = "mouse.wheel_burst", vertical = 1, duration_ms = { min = 46, max = 50 } },
   { do = "wait", ms = { min = 34, max = 50 } },
   { do = "keyboard.key_up", key = "key.d" },
   { do = "keyboard.key_up", key = "key.s" },
@@ -108,7 +108,7 @@ sequence = [
 alternate_sequence = [
   { do = "keyboard.key_down", key = "key.d" },
   { do = "wait", ms = { min = 16, max = 24 } },
-  { do = "mouse.wheel_burst", vertical = -1, duration_ms = 32 },
+  { do = "mouse.wheel_burst", vertical = -1, duration_ms = { min = 30, max = 34 } },
   { do = "wait", ms = { min = 45, max = 55 } },
   { do = "keyboard.key_down", key = "key.w" },
   { do = "wait", ms = { min = 65, max = 80 } },
@@ -117,10 +117,10 @@ alternate_sequence = [
   { do = "keyboard.key_up", key = "key.w" },
   { do = "wait", ms = { min = 4, max = 8 } },
   { do = "keyboard.key_up", key = "key.d" },
-  { do = "mouse.wheel_burst", vertical = 1, duration_ms = 48 },
+  { do = "mouse.wheel_burst", vertical = 1, duration_ms = { min = 46, max = 50 } },
   { do = "wait", ms = { min = 30, max = 42 } },
   { do = "keyboard.key_down", key = "key.s" },
-  { do = "mouse.wheel_burst", vertical = 1, duration_ms = 48 },
+  { do = "mouse.wheel_burst", vertical = 1, duration_ms = { min = 46, max = 50 } },
   { do = "wait", ms = { min = 34, max = 50 } },
   { do = "keyboard.key_up", key = "key.a" },
   { do = "keyboard.key_up", key = "key.s" },
@@ -148,15 +148,15 @@ sequence = [
   { do = "keyboard.key_down", key = "key.d" },
 
   # One bunny-hop scroll: 8 wheel-down inputs at 1 ms intervals.
-  { do = "mouse.wheel_burst", vertical = -1, duration_ms = 8 },
+  { do = "mouse.wheel_burst", vertical = -1, duration_ms = { min = 7, max = 9 } },
   { do = "wait", ms = { min = 140, max = 180 } },
 
   # D -> DW -> DWA, scrolling forward for each new lurch input.
-  { do = "mouse.wheel_burst", vertical = 1, duration_ms = 8 },
+  { do = "mouse.wheel_burst", vertical = 1, duration_ms = { min = 7, max = 9 } },
   { do = "keyboard.key_down", key = "key.w" },
   { do = "wait", ms = { min = 30, max = 50 } },
 
-  { do = "mouse.wheel_burst", vertical = 1, duration_ms = 8 },
+  { do = "mouse.wheel_burst", vertical = 1, duration_ms = { min = 7, max = 9 } },
   { do = "keyboard.key_down", key = "key.a" },
   { do = "wait", ms = { min = 70, max = 100 } },
   { do = "keyboard.key_up", key = "key.w" },
@@ -164,18 +164,18 @@ sequence = [
   { do = "wait", ms = { min = 70, max = 110 } },
 
   # First S tap: A -> AS -> A.
-  { do = "mouse.wheel_burst", vertical = 1, duration_ms = 8 },
+  { do = "mouse.wheel_burst", vertical = 1, duration_ms = { min = 7, max = 9 } },
   { do = "keyboard.key_down", key = "key.s" },
   { do = "wait", ms = { min = 30, max = 50 } },
   { do = "keyboard.key_up", key = "key.s" },
   { do = "wait", ms = { min = 100, max = 130 } },
 
   # Second S input, then finish AS -> ASD -> SD -> D.
-  { do = "mouse.wheel_burst", vertical = 1, duration_ms = 8 },
+  { do = "mouse.wheel_burst", vertical = 1, duration_ms = { min = 7, max = 9 } },
   { do = "keyboard.key_down", key = "key.s" },
   { do = "wait", ms = { min = 70, max = 100 } },
 
-  { do = "mouse.wheel_burst", vertical = 1, duration_ms = 8 },
+  { do = "mouse.wheel_burst", vertical = 1, duration_ms = { min = 7, max = 9 } },
   { do = "keyboard.key_down", key = "key.d" },
   { do = "wait", ms = { min = 100, max = 130 } },
   { do = "keyboard.key_up", key = "key.a" },

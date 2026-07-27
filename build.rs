@@ -92,6 +92,10 @@ enum RepeatConfig {
     Default,
     Name(String),
     Count(u16),
+    Range {
+        min: u16,
+        max: u16,
+    },
 }
 
 #[derive(Deserialize)]
@@ -134,7 +138,7 @@ enum StepConfig {
         vertical: I16Value,
         #[serde(default = "zero_i16")]
         pan: I16Value,
-        duration_ms: u16,
+        duration_ms: U16Value,
     },
     #[serde(rename = "repeat")]
     Repeat {
@@ -361,7 +365,17 @@ fn write_repeat(output: &mut String, repeat: &RepeatConfig, context: &str) {
         RepeatConfig::Default => output.push_str("Repeat::Once"),
         RepeatConfig::Count(count) => {
             assert!(*count != 0, "{context}: repeat count must be positive");
-            output.push_str(&format!("Repeat::Count({count})"));
+            output.push_str(&format!("Repeat::Count(RandomU16::Fixed({count}))"));
+        }
+        RepeatConfig::Range { min, max } => {
+            assert!(*min != 0, "{context}: repeat range must be positive");
+            assert!(
+                min <= max,
+                "{context}: repeat range has min greater than max"
+            );
+            output.push_str(&format!(
+                "Repeat::Count(RandomU16::Uniform {{ min: {min}, max: {max} }})"
+            ));
         }
         RepeatConfig::Name(name) => output.push_str(match name.as_str() {
             "once" => "Repeat::Once",
@@ -420,13 +434,10 @@ fn write_steps(output: &mut String, steps: &[StepConfig], context: &str, depth: 
                 pan,
                 duration_ms,
             } => {
-                assert!(
-                    *duration_ms != 0,
-                    "{context}: wheel burst duration must be positive"
-                );
-                output.push_str(&format!(
-                    "Step::Repeat {{ repeat: Repeat::Count({duration_ms}), steps: &[Step::MouseWheel {{ vertical: "
-                ));
+                validate_positive_u16(duration_ms, context, "wheel burst duration");
+                output.push_str("Step::Repeat { repeat: Repeat::Count(");
+                write_u16(output, duration_ms);
+                output.push_str("), steps: &[Step::MouseWheel { vertical: ");
                 write_i16(output, vertical);
                 output.push_str(", pan: ");
                 write_i16(output, pan);
@@ -453,6 +464,19 @@ fn write_u16(output: &mut String, value: &U16Value) {
         U16Value::Range { min, max } => {
             assert!(min <= max, "random u16 range has min greater than max");
             output.push_str(&format!("RandomU16::Uniform {{ min: {min}, max: {max} }}"))
+        }
+    }
+}
+
+fn validate_positive_u16(value: &U16Value, context: &str, name: &str) {
+    match value {
+        U16Value::Fixed(value) => assert!(*value != 0, "{context}: {name} must be positive"),
+        U16Value::Range { min, max } => {
+            assert!(*min != 0, "{context}: {name} range must be positive");
+            assert!(
+                min <= max,
+                "{context}: {name} range has min greater than max"
+            );
         }
     }
 }
