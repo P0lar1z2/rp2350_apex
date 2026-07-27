@@ -21,7 +21,7 @@ pub use device_clone::{
     parse_clone_configuration,
 };
 pub use hid_report::{
-    DecodedReport, KEY_BITMAP_BYTES, KeyboardState, MouseState, ReportDecoder,
+    DecodedReport, KEY_BITMAP_BYTES, KeyboardState, MouseState, ReportDecoder, ReportEncodeError,
     parse_report_descriptor,
 };
 pub use packet::{

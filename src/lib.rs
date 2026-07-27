@@ -6,4 +6,8 @@
 //! wire-format code here also lets it be unit-tested on the development PC.
 
 pub mod hid_device;
+pub mod macro_engine;
+pub mod macro_config {
+    include!(concat!(env!("OUT_DIR"), "/macro_config.rs"));
+}
 pub mod usb_host;

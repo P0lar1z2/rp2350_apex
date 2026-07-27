@@ -26,6 +26,21 @@ impl KeyboardState {
             self.keys[bit / 8] |= 1 << (bit % 8);
         }
     }
+
+    pub fn release(&mut self, usage: u16) {
+        if (0x04..=0x73).contains(&usage) {
+            let bit = usize::from(usage - 0x04);
+            self.keys[bit / 8] &= !(1 << (bit % 8));
+        }
+    }
+
+    pub fn is_pressed(&self, usage: u16) -> bool {
+        if !(0x04..=0x73).contains(&usage) {
+            return false;
+        }
+        let bit = usize::from(usage - 0x04);
+        self.keys[bit / 8] & (1 << (bit % 8)) != 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +57,14 @@ pub enum DecodedReport {
     Keyboard(KeyboardState),
     Mouse(MouseState),
     Consumer(u16),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReportEncodeError {
+    NoMatchingLayout,
+    BufferTooSmall,
+    TooManyKeys,
+    UnsupportedField,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,6 +151,12 @@ enum ReportLayout {
     Consumer(ConsumerLayout),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReportSize {
+    report_id: u8,
+    bits: u16,
+}
+
 impl ReportLayout {
     const fn report_id(self) -> u8 {
         match self {
@@ -149,6 +178,7 @@ impl ReportLayout {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReportDecoder {
     layouts: [Option<ReportLayout>; MAX_LAYOUTS],
+    report_sizes: [Option<ReportSize>; MAX_LAYOUTS],
     uses_report_ids: bool,
 }
 
@@ -156,6 +186,7 @@ impl ReportDecoder {
     pub const fn empty() -> Self {
         Self {
             layouts: [None; MAX_LAYOUTS],
+            report_sizes: [None; MAX_LAYOUTS],
             uses_report_ids: false,
         }
     }
@@ -181,6 +212,86 @@ impl ReportDecoder {
             ReportLayout::Keyboard(layout) => decode_keyboard(layout, payload),
             ReportLayout::Consumer(layout) => decode_consumer(layout, payload),
         }
+    }
+
+    /// Overwrite the known fields of an existing input report while retaining
+    /// padding and vendor-defined fields. When Report IDs are in use, the ID
+    /// already present in `report` selects the layout and is left unchanged.
+    pub fn encode(
+        &self,
+        decoded: &DecodedReport,
+        report: &mut [u8],
+    ) -> Result<(), ReportEncodeError> {
+        let (report_id, payload) = if self.uses_report_ids {
+            let (report_id, payload) = report
+                .split_first_mut()
+                .ok_or(ReportEncodeError::BufferTooSmall)?;
+            (*report_id, payload)
+        } else {
+            (0, report)
+        };
+        let wanted_kind = match decoded {
+            DecodedReport::Keyboard(_) => LayoutKind::Keyboard,
+            DecodedReport::Mouse(_) => LayoutKind::Mouse,
+            DecodedReport::Consumer(_) => LayoutKind::Consumer,
+        };
+        let layout = self
+            .layouts
+            .iter()
+            .flatten()
+            .copied()
+            .find(|layout| layout.kind() == wanted_kind && layout.report_id() == report_id)
+            .ok_or(ReportEncodeError::NoMatchingLayout)?;
+        match (layout, decoded) {
+            (ReportLayout::Keyboard(layout), DecodedReport::Keyboard(state)) => {
+                encode_keyboard(layout, *state, payload)
+            }
+            (ReportLayout::Mouse(layout), DecodedReport::Mouse(state)) => {
+                encode_mouse(layout, *state, payload)
+            }
+            (ReportLayout::Consumer(layout), DecodedReport::Consumer(usage)) => {
+                encode_consumer(layout, *usage, payload)
+            }
+            _ => Err(ReportEncodeError::NoMatchingLayout),
+        }
+    }
+
+    /// Create a zero-initialized report for the first layout matching
+    /// `decoded`, including its Report ID when required, then encode it.
+    pub fn encode_new(
+        &self,
+        decoded: &DecodedReport,
+        report: &mut [u8],
+    ) -> Result<usize, ReportEncodeError> {
+        let wanted_kind = match decoded {
+            DecodedReport::Keyboard(_) => LayoutKind::Keyboard,
+            DecodedReport::Mouse(_) => LayoutKind::Mouse,
+            DecodedReport::Consumer(_) => LayoutKind::Consumer,
+        };
+        let layout = self
+            .layouts
+            .iter()
+            .flatten()
+            .copied()
+            .find(|layout| layout.kind() == wanted_kind)
+            .ok_or(ReportEncodeError::NoMatchingLayout)?;
+        let size = self
+            .report_sizes
+            .iter()
+            .flatten()
+            .find(|size| size.report_id == layout.report_id())
+            .ok_or(ReportEncodeError::NoMatchingLayout)?;
+        let payload_len = usize::from(size.bits).div_ceil(8);
+        let report_len = payload_len + usize::from(self.uses_report_ids);
+        if report.len() < report_len {
+            return Err(ReportEncodeError::BufferTooSmall);
+        }
+        report[..report_len].fill(0);
+        if self.uses_report_ids {
+            report[0] = layout.report_id();
+        }
+        self.encode(decoded, &mut report[..report_len])?;
+        Ok(report_len)
     }
 
     fn layout_mut(&mut self, kind: LayoutKind, report_id: u8) -> Option<&mut ReportLayout> {
@@ -430,6 +541,12 @@ pub fn parse_report_descriptor(bytes: &[u8]) -> ReportDecoder {
             _ => {}
         }
     }
+    for (index, offset) in offsets[..offset_count].iter().copied().enumerate() {
+        decoder.report_sizes[index] = Some(ReportSize {
+            report_id: offset.report_id,
+            bits: offset.bits,
+        });
+    }
     decoder
 }
 
@@ -602,6 +719,134 @@ fn decode_consumer(layout: ConsumerLayout, payload: &[u8]) -> Option<DecodedRepo
     None
 }
 
+fn encode_mouse(
+    layout: MouseLayout,
+    state: MouseState,
+    payload: &mut [u8],
+) -> Result<(), ReportEncodeError> {
+    if let Some(field) = layout.buttons {
+        for index in 0..field.count.min(8) {
+            let pressed = state.buttons & (1 << index) != 0;
+            insert(
+                payload,
+                field.offset + u16::from(index) * u16::from(field.size),
+                field.size,
+                u32::from(pressed),
+            )?;
+        }
+    }
+    encode_signed_field(payload, layout.x, i32::from(state.x))?;
+    encode_signed_field(payload, layout.y, i32::from(state.y))?;
+    encode_signed_field(payload, layout.wheel, i32::from(state.wheel))?;
+    encode_signed_field(payload, layout.pan, i32::from(state.pan))?;
+    Ok(())
+}
+
+fn encode_keyboard(
+    layout: KeyboardLayout,
+    state: KeyboardState,
+    payload: &mut [u8],
+) -> Result<(), ReportEncodeError> {
+    if let Some(field) = layout.modifiers {
+        for index in 0..field.count.min(8) {
+            let usage = field.usage_min + u16::from(index);
+            let pressed =
+                (0xe0..=0xe7).contains(&usage) && state.modifiers & (1 << (usage - 0xe0)) != 0;
+            insert(
+                payload,
+                field.offset + u16::from(index) * u16::from(field.size),
+                field.size,
+                u32::from(pressed),
+            )?;
+        }
+    }
+    if let Some(field) = layout.key_bitmap {
+        for index in 0..field.count {
+            let usage = field.usage_min + u16::from(index);
+            if !(0x04..=0x73).contains(&usage) {
+                continue;
+            }
+            insert(
+                payload,
+                field.offset + u16::from(index) * u16::from(field.size),
+                field.size,
+                u32::from(state.is_pressed(usage)),
+            )?;
+        }
+    }
+    if let Some(field) = layout.key_array {
+        let mut slot = 0u8;
+        for usage in 0x04..=0x73 {
+            if !state.is_pressed(usage) {
+                continue;
+            }
+            if slot == field.count {
+                return Err(ReportEncodeError::TooManyKeys);
+            }
+            insert(
+                payload,
+                field.offset + u16::from(slot) * u16::from(field.size),
+                field.size,
+                u32::from(usage),
+            )?;
+            slot += 1;
+        }
+        while slot < field.count {
+            insert(
+                payload,
+                field.offset + u16::from(slot) * u16::from(field.size),
+                field.size,
+                0,
+            )?;
+            slot += 1;
+        }
+    }
+    Ok(())
+}
+
+fn encode_consumer(
+    layout: ConsumerLayout,
+    usage: u16,
+    payload: &mut [u8],
+) -> Result<(), ReportEncodeError> {
+    if let Some(field) = layout.array {
+        insert(payload, field.offset, field.size, u32::from(usage))?;
+        for index in 1..field.count {
+            insert(
+                payload,
+                field.offset + u16::from(index) * u16::from(field.size),
+                field.size,
+                0,
+            )?;
+        }
+        return Ok(());
+    }
+    if let Some(field) = layout.bitmap {
+        for index in 0..field.count {
+            insert(
+                payload,
+                field.offset + u16::from(index) * u16::from(field.size),
+                field.size,
+                u32::from(usage != 0 && usage == field.usage_min + u16::from(index)),
+            )?;
+        }
+        return Ok(());
+    }
+    Err(ReportEncodeError::UnsupportedField)
+}
+
+fn encode_signed_field(
+    payload: &mut [u8],
+    field: Option<BitField>,
+    value: i32,
+) -> Result<(), ReportEncodeError> {
+    let Some(field) = field else {
+        return Ok(());
+    };
+    let value = value.clamp(field.logical_min, field.logical_max.max(field.logical_min));
+    insert(payload, field.offset, field.size, value as u32)
+}
+
 fn signed_field(payload: &[u8], field: Option<BitField>) -> Option<i32> {
     let field = field?;
     let value = extract(payload, field.offset, field.size)?;
@@ -623,6 +868,22 @@ fn extract(bytes: &[u8], offset: u16, size: u8) -> Option<u32> {
         value |= u32::from((bytes[source / 8] >> (source % 8)) & 1) << bit;
     }
     Some(value)
+}
+
+fn insert(bytes: &mut [u8], offset: u16, size: u8, value: u32) -> Result<(), ReportEncodeError> {
+    if size == 0 || size > 32 || usize::from(offset) + usize::from(size) > bytes.len() * 8 {
+        return Err(ReportEncodeError::BufferTooSmall);
+    }
+    for bit in 0..size {
+        let destination = usize::from(offset) + usize::from(bit);
+        let mask = 1 << (destination % 8);
+        if value & (1 << bit) != 0 {
+            bytes[destination / 8] |= mask;
+        } else {
+            bytes[destination / 8] &= !mask;
+        }
+    }
+    Ok(())
 }
 
 fn sign_extend(value: u32, size: u8) -> i32 {
@@ -678,6 +939,47 @@ mod tests {
                 pan: -1,
             }))
         );
+
+        let mut report = [2, 0xa5, 0, 0, 0, 0];
+        decoder
+            .encode(
+                &DecodedReport::Mouse(MouseState {
+                    buttons: 0x42,
+                    x: -7,
+                    y: 12,
+                    wheel: -2,
+                    pan: 3,
+                }),
+                &mut report,
+            )
+            .unwrap();
+        assert_eq!(report, [2, 0x42, 0xf9, 12, 0xfe, 3]);
+        assert_eq!(
+            decoder.decode(&report),
+            Some(DecodedReport::Mouse(MouseState {
+                buttons: 0x42,
+                x: -7,
+                y: 12,
+                wheel: -2,
+                pan: 3,
+            }))
+        );
+
+        let mut fresh = [0xa5; 16];
+        let length = decoder
+            .encode_new(
+                &DecodedReport::Mouse(MouseState {
+                    buttons: 1,
+                    x: 2,
+                    y: 3,
+                    wheel: 4,
+                    pan: 5,
+                }),
+                &mut fresh,
+            )
+            .unwrap();
+        assert_eq!(length, 6);
+        assert_eq!(&fresh[..length], &[2, 1, 2, 3, 4, 5]);
     }
 
     #[test]
@@ -697,6 +999,20 @@ mod tests {
                 keys,
             }))
         );
+
+        let mut state = KeyboardState::empty();
+        state.modifiers = 0x11;
+        state.press(0x04);
+        state.press(0x3f);
+        let mut report = [0u8; 8];
+        decoder
+            .encode(&DecodedReport::Keyboard(state), &mut report)
+            .unwrap();
+        assert_eq!(report, [0x11, 0, 0x04, 0x3f, 0, 0, 0, 0]);
+        assert_eq!(
+            decoder.decode(&report),
+            Some(DecodedReport::Keyboard(state))
+        );
     }
 
     #[test]
@@ -710,5 +1026,65 @@ mod tests {
             decoder.decode(&[0xe9, 0x00]),
             Some(DecodedReport::Consumer(0x00e9))
         );
+
+        let mut report = [0u8; 2];
+        decoder
+            .encode(&DecodedReport::Consumer(0x00ea), &mut report)
+            .unwrap();
+        assert_eq!(report, [0xea, 0]);
+    }
+
+    #[test]
+    fn encoding_preserves_padding_and_vendor_bits() {
+        let descriptor = [
+            0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, // Mouse
+            0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x03,
+            0x81, 0x02, // Three buttons
+            0x75, 0x05, 0x95, 0x01, 0x81, 0x01, // Five padding bits
+            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x02,
+            0x81, 0x06, 0xc0,
+        ];
+        let decoder = parse_report_descriptor(&descriptor);
+        let mut report = [0xf8, 0, 0];
+        decoder
+            .encode(
+                &DecodedReport::Mouse(MouseState {
+                    buttons: 0x05,
+                    x: 1,
+                    y: -1,
+                    wheel: 0,
+                    pan: 0,
+                }),
+                &mut report,
+            )
+            .unwrap();
+        assert_eq!(report, [0xfd, 1, 0xff]);
+    }
+
+    #[test]
+    fn encoding_preserves_buttons_beyond_normalized_eight() {
+        let descriptor = [
+            0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, // Mouse
+            0x05, 0x09, 0x19, 0x01, 0x29, 0x0a, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0a,
+            0x81, 0x02, // Ten buttons
+            0x75, 0x06, 0x95, 0x01, 0x81, 0x01, // Padding
+            0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x02,
+            0x81, 0x06, 0xc0,
+        ];
+        let decoder = parse_report_descriptor(&descriptor);
+        let mut report = [0, 0x01, 0, 0]; // Physical button 9 is vendor-preserved.
+        decoder
+            .encode(
+                &DecodedReport::Mouse(MouseState {
+                    buttons: 1,
+                    x: 2,
+                    y: 3,
+                    wheel: 0,
+                    pan: 0,
+                }),
+                &mut report,
+            )
+            .unwrap();
+        assert_eq!(report, [1, 1, 2, 3]);
     }
 }

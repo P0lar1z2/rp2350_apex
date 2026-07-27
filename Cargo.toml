@@ -7,6 +7,8 @@ license = "MIT or Apache-2.0"
 
 [build-dependencies]
 regex = "1.11.0"
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "0.8.23"
 
 # Bit-banged USB timing (ACK turnaround, TX FIFO streaming) needs optimized
 # code even in dev builds; debug info stays on for defmt/probe workflows.
