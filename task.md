@@ -56,6 +56,7 @@
 
 ### 4. Ethernet 控制
 
+- [x] 通过 MDIO 探针确认板载 LAN8720A 的 PHY ID、地址和链路状态。
 - [ ] 接入 ENET DMA 和网络栈。
 - [ ] USB Host 中断优先级高于 USB Device，高于 ENET。
 - [ ] 网络协议只发送控制事件，不进入 USB 中断路径。
@@ -89,4 +90,6 @@
 - RAM runner 修复：按 ELF `p_paddr` 加载 `.data` 初值，并从 ELF `_SEGGER_RTT` 符号定位日志控制块，避免链接布局变化导致静态初值或 RTT 读取错误。
 - 当前动态克隆范围：克隆最多 4 个带 Interrupt IN 的 HID 接口；暂未克隆原始字符串、Interrupt OUT，键盘 LED `SET_REPORT` 当前只确认接收不向下游转发；热插拔后仍需重新枚举 OTG1。
 - 当前阻塞：无。
-- 下一步：连接下游键盘完成宏触发实机验收，再处理不同设备 profile 的运行期重建与 STALL/超时；之后接入 Ethernet 控制面。
+- Ethernet 板级参数：Pro 底板使用 LAN8720 系列 PHY，MDIO 地址 0；GPIO1_IO09 为复位，GPIO1_IO10 需在复位前拉高；RT1052 从 GPIO_B1_10 输出 50 MHz RMII REF_CLK。
+- Ethernet 实测：ENET PLL 锁定；MDIO 读取 `ID1=0x0007`、`ID2=0xC0F1`，确认 LAN8720A；探针运行时 BMSR Link 位为 0（PHY 在线，未建立网线链路）。
+- 下一步：接入 ENET DMA 并收发原始以太网帧；连接下游键盘后补做宏触发实机验收。

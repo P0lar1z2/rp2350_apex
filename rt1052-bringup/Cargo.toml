@@ -30,6 +30,10 @@ path = "src/bin/host_enumerate.rs"
 required-features = ["nxp-host"]
 
 [[bin]]
+name = "enet_probe"
+path = "src/bin/enet_probe.rs"
+
+[[bin]]
 name = "device_hid"
 path = "src/bin/device_hid.rs"
 required-features = ["nxp-host", "nxp-device"]
