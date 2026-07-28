@@ -1,10 +1,10 @@
-//! SPDX-License-Identifier: MIT OR Apache-2.0
-//!
-//! Copyright (c) 2021–2024 The rp-rs Developers
-//! Copyright (c) 2021 rp-rs organization
-//! Copyright (c) 2025 Raspberry Pi Ltd.
-//!
-//! Set up linker scripts
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// Copyright (c) 2021–2024 The rp-rs Developers
+// Copyright (c) 2021 rp-rs organization
+// Copyright (c) 2025 Raspberry Pi Ltd.
+//
+// Set up linker scripts
 
 use std::fs::{File, read_to_string};
 use std::io::Write;

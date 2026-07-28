@@ -8,8 +8,14 @@ use imxrt_ral as ral;
 use imxrt_usbd::{BusAdapter, EndpointMemory, EndpointState, Instances};
 use panic_rtt_target as _;
 use rt1052_bringup::{
-    hid_report::{DecodedReport, parse_report_descriptor},
-    runtime_hid::{RuntimeHid, high_speed_interval},
+    hid_report::{
+        DecodedReport, KeyboardState, MouseState, ReportDecoder, parse_report_descriptor,
+    },
+    macro_config::CONFIG as MACRO_CONFIG,
+    macro_engine::{MacroEngine, MacroMouseReport},
+    runtime_hid::{
+        MAX_HID_INTERFACES, RuntimeCompositeHid, RuntimeHidInterface, high_speed_interval,
+    },
 };
 use rtt_target::{ChannelMode::NoBlockSkip, rprintln, rtt_init_print};
 use usb_device::{
@@ -23,6 +29,9 @@ const NVIC_ISER3: usize = 0xE000_E10C;
 const NVIC_ICPR3: usize = 0xE000_E28C;
 const NVIC_IPR_USB_OTG2: usize = 0xE000_E470;
 const USB_OTG2_VECTOR: usize = (16 + 112) * 4;
+const DEMCR: usize = 0xE000_EDFC;
+const DWT_CTRL: usize = 0xE000_1000;
+const DWT_CYCCNT: usize = 0xE000_1004;
 
 #[unsafe(link_section = ".usb_device.endpoint_memory")]
 static EP_MEMORY: EndpointMemory<2048> = EndpointMemory::new();
@@ -47,7 +56,7 @@ struct HostEvent {
     interface_number: u8,
     interface_subclass: u8,
     interface_protocol: u8,
-    reserved: u8,
+    interface_index: u8,
 }
 
 impl HostEvent {
@@ -67,7 +76,7 @@ impl HostEvent {
             interface_number: 0,
             interface_subclass: 0,
             interface_protocol: 0,
-            reserved: 0,
+            interface_index: 0,
         }
     }
 }
@@ -79,7 +88,8 @@ struct HostReport {
     length: u8,
     status: u8,
     data: [u8; 64],
-    reserved: u16,
+    interface_number: u8,
+    interface_index: u8,
 }
 
 const _: () = assert!(core::mem::size_of::<HostEvent>() == 18);
@@ -92,7 +102,8 @@ impl HostReport {
             length: 0,
             status: 0,
             data: [0; 64],
-            reserved: 0,
+            interface_number: 0,
+            interface_index: 0,
         }
     }
 }
@@ -103,8 +114,60 @@ unsafe extern "C" {
     fn nxp_host_irq();
     fn nxp_host_pop_event(event: *mut HostEvent) -> i32;
     fn nxp_host_pop_report(report: *mut HostReport) -> i32;
-    fn nxp_host_copy_report_descriptor(buffer: *mut u8, capacity: u16) -> i32;
+    fn nxp_host_copy_report_descriptor(interface_index: u8, buffer: *mut u8, capacity: u16) -> i32;
     fn nxp_device_init_clocks() -> i32;
+    fn nxp_core_clock_hz() -> u32;
+}
+
+struct CycleClock {
+    last_cycle: u32,
+    remainder: u32,
+    micros: u32,
+    cycles_per_us: u32,
+}
+
+impl CycleClock {
+    fn new(core_hz: u32) -> Self {
+        write32(
+            DEMCR,
+            unsafe { read_volatile(DEMCR as *const u32) } | (1 << 24),
+        );
+        write32(DWT_CYCCNT, 0);
+        write32(
+            DWT_CTRL,
+            unsafe { read_volatile(DWT_CTRL as *const u32) } | 1,
+        );
+        Self {
+            last_cycle: 0,
+            remainder: 0,
+            micros: 0,
+            cycles_per_us: (core_hz / 1_000_000).max(1),
+        }
+    }
+
+    fn now_us(&mut self) -> u32 {
+        let cycle = unsafe { read_volatile(DWT_CYCCNT as *const u32) };
+        let elapsed = cycle.wrapping_sub(self.last_cycle);
+        self.last_cycle = cycle;
+        let total = self.remainder.saturating_add(elapsed);
+        self.micros = self.micros.wrapping_add(total / self.cycles_per_us);
+        self.remainder = total % self.cycles_per_us;
+        self.micros
+    }
+}
+
+fn merge_mouse(physical: MouseState, generated: MacroMouseReport) -> MouseState {
+    MouseState {
+        buttons: generated.buttons,
+        x: physical.x.saturating_add(generated.x),
+        y: physical.y.saturating_add(generated.y),
+        wheel: i16::from(physical.wheel)
+            .saturating_add(i16::from(generated.wheel))
+            .clamp(i16::from(i8::MIN), i16::from(i8::MAX)) as i8,
+        pan: i16::from(physical.pan)
+            .saturating_add(i16::from(generated.pan))
+            .clamp(i16::from(i8::MIN), i16::from(i8::MAX)) as i8,
+    }
 }
 
 #[inline]
@@ -147,10 +210,12 @@ fn main() -> ! {
     unsafe { cortex_m::interrupt::enable() };
 
     rprintln!("waiting for OTG2 source profile before attaching OTG1");
-    let mut source = HostEvent::empty();
-    let mut have_source = false;
-    let mut report_descriptor = [0u8; 512];
-    let report_descriptor_len = 'profile: loop {
+    let mut sources = [HostEvent::empty(); MAX_HID_INTERFACES];
+    let mut report_descriptors = [[0u8; 512]; MAX_HID_INTERFACES];
+    let mut report_descriptor_lens = [0usize; MAX_HID_INTERFACES];
+    let mut attached_mask = 0u8;
+    let mut descriptor_done_mask = 0u8;
+    'profile: loop {
         // SAFETY: Called only from this main loop; USB2 IRQ handles controller events.
         unsafe { nxp_host_task() };
         let mut event = HostEvent::empty();
@@ -158,58 +223,117 @@ fn main() -> ! {
         while unsafe { nxp_host_pop_event(&mut event) } != 0 {
             match event.kind {
                 1 => {
-                    source = event;
-                    have_source = true;
+                    let index = usize::from(event.interface_index);
+                    if index < MAX_HID_INTERFACES {
+                        sources[index] = event;
+                        attached_mask |= 1 << index;
+                    }
                     rprintln!(
-                        "source {:04x}:{:04x} speed={} subclass={} protocol={} packet={} interval={}",
-                        source.vid,
-                        source.pid,
-                        source.speed,
-                        source.interface_subclass,
-                        source.interface_protocol,
-                        source.max_packet_size,
-                        source.interval
+                        "source[{}] if={} {:04x}:{:04x} speed={} subclass={} protocol={} packet={} interval={}",
+                        event.interface_index,
+                        event.interface_number,
+                        event.vid,
+                        event.pid,
+                        event.speed,
+                        event.interface_subclass,
+                        event.interface_protocol,
+                        event.max_packet_size,
+                        event.interval
                     );
                 }
                 2 => {
-                    have_source = false;
+                    attached_mask = 0;
+                    descriptor_done_mask = 0;
+                    report_descriptor_lens.fill(0);
                     rprintln!("source detached while reading profile");
                 }
                 3 => rprintln!("OTG2 enumeration failed status={}", event.status),
-                4 if event.status == 0 => rprintln!("OTG2 Interrupt IN ready"),
-                4 => rprintln!("OTG2 receiver failed status={}", event.status),
-                5 if event.status == 0 && have_source => {
-                    // SAFETY: Destination capacity matches the FFI argument.
-                    let length = unsafe {
-                        nxp_host_copy_report_descriptor(report_descriptor.as_mut_ptr(), 512)
-                    };
-                    if length > 0 {
-                        let length = usize::try_from(length)
-                            .unwrap_or(0)
-                            .min(report_descriptor.len());
-                        break 'profile length;
+                4 if event.status == 0 => {
+                    rprintln!("OTG2 HID[{}] Interrupt IN ready", event.interface_index)
+                }
+                4 => rprintln!(
+                    "OTG2 HID[{}] receiver failed status={}",
+                    event.interface_index,
+                    event.status
+                ),
+                5 => {
+                    let index = usize::from(event.interface_index);
+                    if index < MAX_HID_INTERFACES && attached_mask & (1 << index) != 0 {
+                        if event.status == 0 {
+                            // SAFETY: Destination capacity matches the FFI argument.
+                            let length = unsafe {
+                                nxp_host_copy_report_descriptor(
+                                    event.interface_index,
+                                    report_descriptors[index].as_mut_ptr(),
+                                    512,
+                                )
+                            };
+                            report_descriptor_lens[index] = usize::try_from(length)
+                                .unwrap_or(0)
+                                .min(report_descriptors[index].len());
+                            rprintln!(
+                                "OTG2 HID[{}] descriptor={} bytes",
+                                index,
+                                report_descriptor_lens[index]
+                            );
+                        } else {
+                            rprintln!(
+                                "OTG2 HID[{}] descriptor failed status={}",
+                                index,
+                                event.status
+                            );
+                        }
+                        descriptor_done_mask |= 1 << index;
                     }
                 }
-                5 => rprintln!("OTG2 descriptor failed status={}", event.status),
                 _ => {}
             }
         }
-    };
+        let mut stale_report = HostReport::empty();
+        // Avoid filling the shared queue while all interface descriptors arrive.
+        while unsafe { nxp_host_pop_report(&mut stale_report) } != 0 {}
+        if attached_mask != 0 && descriptor_done_mask == attached_mask {
+            break 'profile;
+        }
+    }
 
-    let upstream_interval = high_speed_interval(source.speed, source.interval);
-    rprintln!(
-        "profile ready: descriptor={} bytes, HS interval={} (source interval={})",
-        report_descriptor_len,
-        upstream_interval,
-        source.interval
-    );
-    if source.max_packet_size > 64 {
-        rprintln!(
-            "unsupported source packet size {}; bridge capacity is 64 bytes",
-            source.max_packet_size
-        );
+    let identity = sources
+        .iter()
+        .copied()
+        .find(|source| source.max_packet_size != 0)
+        .expect("at least one HID source");
+    let profiles: [Option<RuntimeHidInterface<'_>>; MAX_HID_INTERFACES] =
+        core::array::from_fn(|index| {
+            let source = sources[index];
+            let descriptor_len = report_descriptor_lens[index];
+            if attached_mask & (1 << index) == 0
+                || descriptor_len == 0
+                || source.max_packet_size > 64
+            {
+                return None;
+            }
+            let interval = high_speed_interval(source.speed, source.interval);
+            rprintln!(
+                "profile[{}]: if={} descriptor={} packet={} HS interval={} protocol={}",
+                index,
+                source.interface_number,
+                descriptor_len,
+                source.max_packet_size,
+                interval,
+                source.interface_protocol
+            );
+            Some(RuntimeHidInterface {
+                report_descriptor: &report_descriptors[index][..descriptor_len],
+                max_packet_size: source.max_packet_size,
+                interval,
+                subclass: source.interface_subclass,
+                protocol: source.interface_protocol,
+            })
+        });
+    let active_count = profiles.iter().flatten().count();
+    if active_count == 0 {
+        rprintln!("no cloneable HID interfaces (descriptor required, packet <= 64)");
         loop {
-            // Keep servicing OTG2 so detach and controller state remain clean.
             unsafe { nxp_host_task() };
         }
     }
@@ -230,19 +354,12 @@ fn main() -> ! {
         usbphy: unsafe { ral::usbphy::USBPHY1::instance() },
     };
     let bus = UsbBusAllocator::new(BusAdapter::new(instances, &EP_MEMORY, &EP_STATE));
-    let mut hid = RuntimeHid::new(
-        &bus,
-        &report_descriptor[..report_descriptor_len],
-        source.max_packet_size.clamp(1, 64),
-        upstream_interval,
-        source.interface_subclass,
-        source.interface_protocol,
-    );
+    let mut hid = RuntimeCompositeHid::new(&bus, profiles);
     let strings = [StringDescriptors::default()
         .manufacturer("xense")
-        .product("RT1052 Dynamic HID Clone")
-        .serial_number("RAM-CLONE")];
-    let mut device = UsbDeviceBuilder::new(&bus, UsbVidPid(source.vid, source.pid))
+        .product("RT1052 Composite HID Clone")
+        .serial_number("RAM-COMPOSITE")];
+    let mut device = UsbDeviceBuilder::new(&bus, UsbVidPid(identity.vid, identity.pid))
         .strings(&strings)
         .expect("valid static USB strings")
         .device_class(0)
@@ -250,11 +367,64 @@ fn main() -> ! {
         .expect("64-byte EP0 is valid for high-speed USB")
         .build();
 
-    rprintln!("dynamic clone running: OTG2 raw HID -> OTG1 cloned HID");
-    let decoder = parse_report_descriptor(&report_descriptor[..report_descriptor_len]);
+    rprintln!(
+        "dynamic composite clone running: {} OTG2 HID interfaces -> OTG1",
+        active_count
+    );
+    let decoders: [ReportDecoder; MAX_HID_INTERFACES] = core::array::from_fn(|index| {
+        let length = report_descriptor_lens[index];
+        if length == 0 {
+            ReportDecoder::empty()
+        } else {
+            parse_report_descriptor(&report_descriptors[index][..length])
+        }
+    });
+    let mut keyboard_interface = None;
+    let mut keyboard_template = [0u8; 64];
+    let mut keyboard_template_len = 0usize;
+    let mut mouse_interface = None;
+    let mut mouse_template = [0u8; 64];
+    let mut mouse_template_len = 0usize;
+    let empty_keyboard = DecodedReport::Keyboard(KeyboardState::empty());
+    let empty_mouse = DecodedReport::Mouse(MouseState {
+        buttons: 0,
+        x: 0,
+        y: 0,
+        wheel: 0,
+        pan: 0,
+    });
+    for (index, decoder) in decoders.iter().enumerate() {
+        if keyboard_interface.is_none()
+            && let Ok(length) = decoder.encode_new(&empty_keyboard, &mut keyboard_template)
+        {
+            keyboard_interface = Some(index);
+            keyboard_template_len = length;
+        }
+        if mouse_interface.is_none()
+            && let Ok(length) = decoder.encode_new(&empty_mouse, &mut mouse_template)
+        {
+            mouse_interface = Some(index);
+            mouse_template_len = length;
+        }
+    }
+    let core_hz = unsafe { nxp_core_clock_hz() };
+    let mut clock = CycleClock::new(core_hz);
+    let mut macro_engine = MacroEngine::new(
+        &MACRO_CONFIG,
+        u64::from(core_hz) ^ (u64::from(identity.vid) << 32) ^ u64::from(identity.pid),
+    );
+    rprintln!(
+        "macro engine ready: core={} Hz keyboard={:?} mouse={:?}",
+        core_hz,
+        keyboard_interface,
+        mouse_interface
+    );
     let mut device_configured = false;
-    let mut forwarded = 0u32;
-    let mut dropped = 0u32;
+    let mut forwarded = [0u32; MAX_HID_INTERFACES];
+    let mut dropped = [0u32; MAX_HID_INTERFACES];
+    let mut pending = [[0u8; 64]; MAX_HID_INTERFACES];
+    let mut pending_len = [0usize; MAX_HID_INTERFACES];
+    let mut pending_ready = [false; MAX_HID_INTERFACES];
 
     loop {
         // SAFETY: Called only from this main loop; USB2 IRQ handles controller events.
@@ -264,10 +434,71 @@ fn main() -> ! {
             if !device_configured {
                 device.bus().configure();
                 device_configured = true;
-                rprintln!("OTG1 bridge configured by PC");
+                rprintln!("OTG1 composite bridge configured by PC");
             }
         } else {
             device_configured = false;
+        }
+
+        for index in 0..MAX_HID_INTERFACES {
+            if !pending_ready[index] || !device_configured {
+                continue;
+            }
+            match hid.push_report(index, &pending[index][..pending_len[index]]) {
+                Ok(_) => {
+                    pending_ready[index] = false;
+                    forwarded[index] = forwarded[index].wrapping_add(1);
+                }
+                Err(UsbError::WouldBlock) => {}
+                Err(_) => {
+                    pending_ready[index] = false;
+                    dropped[index] = dropped[index].wrapping_add(1);
+                }
+            }
+        }
+
+        macro_engine.tick(clock.now_us());
+        if device_configured {
+            if let Some(index) = keyboard_interface
+                && !pending_ready[index]
+                && macro_engine.has_keyboard_output()
+                && let Some(generated) = macro_engine.take_keyboard_output()
+            {
+                pending[index][..keyboard_template_len]
+                    .copy_from_slice(&keyboard_template[..keyboard_template_len]);
+                if decoders[index]
+                    .encode(
+                        &DecodedReport::Keyboard(generated),
+                        &mut pending[index][..keyboard_template_len],
+                    )
+                    .is_ok()
+                {
+                    pending_len[index] = keyboard_template_len;
+                    pending_ready[index] = true;
+                }
+            }
+            if let Some(index) = mouse_interface
+                && !pending_ready[index]
+                && macro_engine.has_mouse_output()
+                && let Some(generated) = macro_engine.take_mouse_output()
+            {
+                pending[index][..mouse_template_len]
+                    .copy_from_slice(&mouse_template[..mouse_template_len]);
+                let generated = DecodedReport::Mouse(MouseState {
+                    buttons: generated.buttons,
+                    x: generated.x,
+                    y: generated.y,
+                    wheel: generated.wheel,
+                    pan: generated.pan,
+                });
+                if decoders[index]
+                    .encode(&generated, &mut pending[index][..mouse_template_len])
+                    .is_ok()
+                {
+                    pending_len[index] = mouse_template_len;
+                    pending_ready[index] = true;
+                }
+            }
         }
 
         let mut event = HostEvent::empty();
@@ -299,33 +530,98 @@ fn main() -> ! {
         let mut report = HostReport::empty();
         // SAFETY: `report` is writable storage matching the C ABI.
         while unsafe { nxp_host_pop_report(&mut report) } != 0 {
-            let length = usize::from(report.length.min(64));
-            if !device_configured {
-                dropped = dropped.wrapping_add(1);
+            let index = usize::from(report.interface_index);
+            if index >= MAX_HID_INTERFACES || profiles[index].is_none() {
                 continue;
             }
-            match hid.push_report(&report.data[..length]) {
-                Ok(_) => forwarded = forwarded.wrapping_add(1),
-                Err(UsbError::WouldBlock) => dropped = dropped.wrapping_add(1),
-                Err(_) => dropped = dropped.wrapping_add(1),
+            let length = usize::from(report.length.min(64));
+            if !device_configured || pending_ready[index] {
+                dropped[index] = dropped[index].wrapping_add(1);
+                continue;
             }
-            if forwarded <= 16 || forwarded & 127 == 0 {
-                match decoder.decode(&report.data[..length]) {
+            pending[index][..length].copy_from_slice(&report.data[..length]);
+            let decoded = decoders[index].decode(&pending[index][..length]);
+            if let Some(original) = decoded {
+                let mut transformed = macro_engine.observe(original);
+                let mut needs_encode = transformed != original;
+                match transformed {
+                    DecodedReport::Keyboard(state) => {
+                        keyboard_interface = Some(index);
+                        keyboard_template[..length].copy_from_slice(&pending[index][..length]);
+                        keyboard_template_len = length;
+                        if let Some(generated) = macro_engine.take_keyboard_output() {
+                            needs_encode |= generated != state;
+                            transformed = DecodedReport::Keyboard(generated);
+                        }
+                    }
+                    DecodedReport::Mouse(physical) => {
+                        mouse_interface = Some(index);
+                        mouse_template[..length].copy_from_slice(&pending[index][..length]);
+                        mouse_template_len = length;
+                        if let Some(generated) = macro_engine.take_mouse_output() {
+                            needs_encode |= generated.x != 0
+                                || generated.y != 0
+                                || generated.wheel != 0
+                                || generated.pan != 0
+                                || generated.buttons != physical.buttons;
+                            transformed = DecodedReport::Mouse(merge_mouse(physical, generated));
+                        }
+                    }
+                    DecodedReport::Consumer(_) => {}
+                }
+                if needs_encode {
+                    let _ = decoders[index].encode(&transformed, &mut pending[index][..length]);
+                }
+                match transformed {
+                    DecodedReport::Keyboard(_) => {
+                        keyboard_template[..length].copy_from_slice(&pending[index][..length])
+                    }
+                    DecodedReport::Mouse(_) => {
+                        mouse_template[..length].copy_from_slice(&pending[index][..length]);
+                    }
+                    DecodedReport::Consumer(_) => {}
+                }
+            }
+            pending_len[index] = length;
+            pending_ready[index] = true;
+            match hid.push_report(index, &pending[index][..length]) {
+                Ok(_) => {
+                    pending_ready[index] = false;
+                    forwarded[index] = forwarded[index].wrapping_add(1);
+                }
+                Err(UsbError::WouldBlock) => {}
+                Err(_) => {
+                    pending_ready[index] = false;
+                    dropped[index] = dropped[index].wrapping_add(1);
+                }
+            }
+            if forwarded[index] <= 8 || forwarded[index] & 127 == 0 {
+                match decoded {
                     Some(DecodedReport::Mouse(mouse)) => rprintln!(
-                        "clone #{} buttons={:#04x} x={} y={} wheel={} pan={} dropped={}",
-                        forwarded,
+                        "clone[{}] #{} buttons={:#04x} x={} y={} wheel={} pan={} dropped={}",
+                        index,
+                        forwarded[index],
                         mouse.buttons,
                         mouse.x,
                         mouse.y,
                         mouse.wheel,
                         mouse.pan,
-                        dropped
+                        dropped[index]
+                    ),
+                    Some(DecodedReport::Keyboard(keyboard)) => rprintln!(
+                        "clone[{}] #{} modifiers={:#04x} keys={:02x?} dropped={}",
+                        index,
+                        forwarded[index],
+                        keyboard.modifiers,
+                        keyboard.keys,
+                        dropped[index]
                     ),
                     _ => rprintln!(
-                        "clone #{} raw_len={} dropped={}",
-                        forwarded,
+                        "clone[{}] #{} raw_len={} dropped={}",
+                        index,
+                        forwarded[index],
                         length,
-                        dropped
+                        dropped[index]
                     ),
                 }
             }

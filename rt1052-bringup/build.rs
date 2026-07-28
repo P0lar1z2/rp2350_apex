@@ -2,6 +2,15 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[allow(dead_code)]
+mod macro_generator {
+    include!("../build.rs");
+
+    pub fn generate(out: &std::path::Path) {
+        compile_macro_config(out);
+    }
+}
+
 fn run(mut command: Command, description: &str) {
     let status = command
         .status()
@@ -100,6 +109,17 @@ fn main() {
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory"));
     println!("cargo:rustc-link-search={}", env!("CARGO_MANIFEST_DIR"));
     println!("cargo:rerun-if-changed=memory.x");
+
+    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
+    let previous_dir = env::current_dir().expect("build script current directory");
+    let repository = manifest
+        .parent()
+        .expect("bring-up crate must be inside the repository");
+    env::set_current_dir(repository).expect("enter repository for macro config generation");
+    macro_generator::generate(&out);
+    env::set_current_dir(previous_dir).expect("restore build script current directory");
+    println!("cargo:rerun-if-changed=../macro_config.toml");
+    println!("cargo:rerun-if-changed=../build.rs");
 
     if env::var_os("CARGO_FEATURE_NXP_HOST").is_some() {
         compile_nxp_host(&manifest);

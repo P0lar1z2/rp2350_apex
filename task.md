@@ -48,7 +48,8 @@
 - [x] 完成首条固定 HID 鼠标桥接：OTG2 原始报告经 Rust 解码后由 OTG1 转发。
 - [x] 根据来源设备描述符创建单个 HID 接口和 Interrupt IN 端点。
 - [x] 按来源速度换算上游 High-Speed `bInterval`：8K 来源保持 1，当前 Full-Speed 1 ms 来源转换为 4。
-- [ ] 完成动态 HID 克隆和宏引擎迁移。
+- [x] 完成来源复合 HID 的动态接口/描述符克隆。
+- [ ] 完成宏引擎实机触发验收（代码、共享配置和 20 项单元测试已迁移；待下游键盘操作）。
 - [x] 复用现有无分配 Rust HID Report Descriptor 解析器，并在 RT1052 实机解码鼠标报告。
 - [ ] 处理热插拔、STALL、超时和设备重新枚举。
 
@@ -80,6 +81,9 @@
 - 实测动态克隆：从来源读取 VID/PID、HID subclass/protocol、185 字节 Report Descriptor、端点包长和轮询间隔，再创建 OTG1 单接口 HID；Linux 实测识别为 `17ef:62c2`、480 Mbit/s、EP0 64、Interrupt IN 8 字节、`bInterval=4`。
 - 实测原始转发：动态克隆路径连续转发超过 1,536 个原始报告，按键和 X/Y 正确，观测窗口内 `dropped=0`。
 - Host→Rust 报告队列和动态 Device 原始转发容量为 64 字节；更大端点会明确拒绝，不允许 DMA 缓冲越界或静默截断。
-- 当前动态克隆范围：只克隆选中的鼠标 HID 接口，不克隆接收器的完整复合配置、原始字符串或其他接口；热插拔后仍需重新枚举 OTG1。
+- 实测复合克隆：NXP Host 同时打开来源 Boot Keyboard（接口 0、71 字节描述符）和 Boot Mouse（接口 1、185 字节描述符）；OTG1 动态生成两个 HID 接口，Linux 在 480 Mbit/s 下同时绑定两个 `usbhid`，端点均为 8 字节、`bInterval=4`。
+- 宏引擎迁移：RT1052 直接复用根工程 `macro_engine.rs` 和由同一 `macro_config.toml` 生成的配置；DWT 以实测默认核心时钟 528 MHz 累计微秒，物理/合成报告按来源接口解码、变换并重新编码。
+- RAM runner 修复：按 ELF `p_paddr` 加载 `.data` 初值，并从 ELF `_SEGGER_RTT` 符号定位日志控制块，避免链接布局变化导致静态初值或 RTT 读取错误。
+- 当前动态克隆范围：克隆最多 4 个带 Interrupt IN 的 HID 接口；暂未克隆原始字符串、Interrupt OUT，键盘 LED `SET_REPORT` 当前只确认接收不向下游转发；热插拔后仍需重新枚举 OTG1。
 - 当前阻塞：无。
-- 下一步：处理来源设备热插拔和 OTG1 自动重枚举，再迁移宏引擎；之后接入 Ethernet 控制面。
+- 下一步：连接下游键盘完成宏触发实机验收，随后处理热插拔和 OTG1 自动重枚举；之后接入 Ethernet 控制面。

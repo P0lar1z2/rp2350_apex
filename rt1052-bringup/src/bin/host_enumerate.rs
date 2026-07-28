@@ -34,7 +34,7 @@ struct HostEvent {
     interface_number: u8,
     interface_subclass: u8,
     interface_protocol: u8,
-    reserved: u8,
+    interface_index: u8,
 }
 
 #[repr(C)]
@@ -44,7 +44,8 @@ struct HostReport {
     length: u8,
     status: u8,
     data: [u8; 64],
-    reserved: u16,
+    interface_number: u8,
+    interface_index: u8,
 }
 
 const _: () = assert!(core::mem::size_of::<HostEvent>() == 18);
@@ -56,7 +57,7 @@ unsafe extern "C" {
     fn nxp_host_irq();
     fn nxp_host_pop_event(event: *mut HostEvent) -> i32;
     fn nxp_host_pop_report(report: *mut HostReport) -> i32;
-    fn nxp_host_copy_report_descriptor(buffer: *mut u8, capacity: u16) -> i32;
+    fn nxp_host_copy_report_descriptor(interface_index: u8, buffer: *mut u8, capacity: u16) -> i32;
 }
 
 #[inline]
@@ -125,9 +126,9 @@ fn main() -> ! {
     unsafe { write_volatile(NVIC_IPR_USB_OTG2 as *mut u8, 3 << 4) };
     write32(NVIC_ISER3, 1 << 16);
     unsafe { cortex_m::interrupt::enable() };
-    rprintln!("OTG2 EHCI running; waiting for FE1.1S hub and HID mouse");
+    rprintln!("OTG2 EHCI running; waiting for FE1.1S hub and composite HID");
 
-    let mut decoder = ReportDecoder::empty();
+    let mut decoders = [ReportDecoder::empty(); 4];
 
     loop {
         // SAFETY: Bare-metal task function is called from this one main loop.
@@ -148,14 +149,15 @@ fn main() -> ! {
             interface_number: 0,
             interface_subclass: 0,
             interface_protocol: 0,
-            reserved: 0,
+            interface_index: 0,
         };
         // SAFETY: `event` is valid writable storage matching the C ABI.
         while unsafe { nxp_host_pop_event(&mut event) } != 0 {
             match event.kind {
                 1 => {
                     rprintln!(
-                        "HID {:04x}:{:04x} addr={} via hub={} port={} interface={} subclass={} protocol={}",
+                        "HID[{}] {:04x}:{:04x} addr={} via hub={} port={} interface={} subclass={} protocol={}",
+                        event.interface_index,
                         event.vid,
                         event.pid,
                         event.address,
@@ -180,20 +182,37 @@ fn main() -> ! {
                 }
                 2 => rprintln!("HID detached"),
                 3 => rprintln!("enumeration failed, status={}", event.status),
-                4 if event.status == 0 => rprintln!("HID Interrupt IN receiver ready"),
-                4 => rprintln!("HID receiver setup failed, status={}", event.status),
+                4 if event.status == 0 => {
+                    rprintln!("HID[{}] Interrupt IN receiver ready", event.interface_index)
+                }
+                4 => rprintln!(
+                    "HID[{}] receiver setup failed, status={}",
+                    event.interface_index,
+                    event.status
+                ),
                 5 if event.status == 0 => {
                     let mut descriptor = [0u8; 512];
                     // SAFETY: The destination has the advertised 512-byte capacity.
-                    let length =
-                        unsafe { nxp_host_copy_report_descriptor(descriptor.as_mut_ptr(), 512) };
+                    let length = unsafe {
+                        nxp_host_copy_report_descriptor(
+                            event.interface_index,
+                            descriptor.as_mut_ptr(),
+                            512,
+                        )
+                    };
                     if length > 0 {
                         let length = usize::try_from(length).unwrap_or(0).min(descriptor.len());
-                        rprintln!("HID Report Descriptor: {} bytes", length);
+                        rprintln!(
+                            "HID[{}] Report Descriptor: {} bytes",
+                            event.interface_index,
+                            length
+                        );
                         for (offset, chunk) in descriptor[..length].chunks(16).enumerate() {
                             rprintln!("  {:03x}: {:02x?}", offset * 16, chunk);
                         }
-                        decoder = parse_report_descriptor(&descriptor[..length]);
+                        let decoder = parse_report_descriptor(&descriptor[..length]);
+                        decoders[usize::from(event.interface_index).min(decoders.len() - 1)] =
+                            decoder;
                         if decoder.is_empty() {
                             rprintln!("Rust HID parser found no supported input layout");
                         } else {
@@ -204,7 +223,8 @@ fn main() -> ! {
                     }
                 }
                 5 => rprintln!(
-                    "HID Report Descriptor request failed, status={}",
+                    "HID[{}] Report Descriptor request failed, status={}",
+                    event.interface_index,
                     event.status
                 ),
                 _ => {}
@@ -216,19 +236,24 @@ fn main() -> ! {
             length: 0,
             status: 0,
             data: [0; 64],
-            reserved: 0,
+            interface_number: 0,
+            interface_index: 0,
         };
         // SAFETY: `report` is valid writable storage matching the C ABI.
         while unsafe { nxp_host_pop_report(&mut report) } != 0 {
             let length = usize::from(report.length.min(64));
             if report.sequence <= 16 || (report.sequence & 127) == 0 || report.status != 0 {
                 rprintln!(
-                    "report #{} status={} len={} data={:02x?}",
+                    "report #{} HID[{}]/if={} status={} len={} data={:02x?}",
                     report.sequence,
+                    report.interface_index,
+                    report.interface_number,
                     report.status,
                     length,
                     &report.data[..length]
                 );
+                let decoder =
+                    &decoders[usize::from(report.interface_index).min(decoders.len() - 1)];
                 match decoder.decode(&report.data[..length]) {
                     Some(DecodedReport::Mouse(mouse)) => rprintln!(
                         "mouse buttons={:#04x} x={} y={} wheel={} pan={}",

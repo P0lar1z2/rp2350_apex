@@ -29,7 +29,7 @@ typedef struct
     uint8_t interfaceNumber;
     uint8_t interfaceSubclass;
     uint8_t interfaceProtocol;
-    uint8_t reserved;
+    uint8_t interfaceIndex;
 } nxp_host_event_t;
 
 typedef struct
@@ -38,7 +38,8 @@ typedef struct
     uint8_t length;
     uint8_t status;
     uint8_t data[64];
-    uint16_t reserved;
+    uint8_t interfaceNumber;
+    uint8_t interfaceIndex;
 } nxp_host_report_t;
 
 _Static_assert(sizeof(nxp_host_event_t) == 18U, "nxp_host_event_t ABI changed");
@@ -49,7 +50,8 @@ void nxp_host_task(void);
 void nxp_host_irq(void);
 int32_t nxp_host_pop_event(nxp_host_event_t *event);
 int32_t nxp_host_pop_report(nxp_host_report_t *report);
-int32_t nxp_host_copy_report_descriptor(uint8_t *buffer, uint16_t capacity);
+int32_t nxp_host_copy_report_descriptor(uint8_t interfaceIndex, uint8_t *buffer, uint16_t capacity);
 int32_t nxp_device_init_clocks(void);
+uint32_t nxp_core_clock_hz(void);
 
 #endif

@@ -8,24 +8,39 @@
 #include "usb_phy.h"
 
 #define HOST_CONTROLLER_ID ((uint8_t)kUSB_ControllerEhci1)
-#define EVENT_QUEUE_CAPACITY (8U)
+#define EVENT_QUEUE_CAPACITY (32U)
 #define REPORT_QUEUE_CAPACITY (32U)
 #define REPORT_DATA_CAPACITY (64U)
 #define HID_RX_BUFFER_SIZE (64U)
 #define HID_REPORT_DESCRIPTOR_CAPACITY (512U)
+#define MAX_HID_INTERFACES (4U)
+
+typedef struct
+{
+    uint8_t occupied;
+    uint8_t openStarted;
+    uint8_t interfaceIndex;
+    uint8_t interfaceNumber;
+    uint8_t interfaceSubclass;
+    uint8_t interfaceProtocol;
+    uint8_t endpointAddress;
+    uint8_t interval;
+    uint16_t packetSize;
+    uint16_t reportDescriptorLength;
+    volatile uint16_t reportDescriptorActualLength;
+    usb_host_interface_handle interfaceHandle;
+    usb_host_class_handle classHandle;
+    volatile uint8_t receiveArmed;
+} hid_slot_t;
 
 static usb_host_handle s_hostHandle;
 static usb_device_handle s_hidDevice;
 static usb_host_configuration_handle s_hidConfiguration;
-static usb_host_interface_handle s_hidInterface;
-static usb_host_class_handle s_hidClass;
-static uint16_t s_hidPacketSize;
-static uint16_t s_reportDescriptorLength;
-static volatile uint16_t s_reportDescriptorActualLength;
+static hid_slot_t s_hidSlots[MAX_HID_INTERFACES];
 __attribute__((section(".usb_dma.hid_rx"), aligned(32)))
-static uint8_t s_hidRxBuffer[HID_RX_BUFFER_SIZE];
+static uint8_t s_hidRxBuffers[MAX_HID_INTERFACES][HID_RX_BUFFER_SIZE];
 __attribute__((section(".usb_dma.hid_report"), aligned(32)))
-static uint8_t s_reportDescriptor[HID_REPORT_DESCRIPTOR_CAPACITY];
+static uint8_t s_reportDescriptors[MAX_HID_INTERFACES][HID_REPORT_DESCRIPTOR_CAPACITY];
 static nxp_host_event_t s_events[EVENT_QUEUE_CAPACITY];
 static volatile uint8_t s_eventRead;
 static volatile uint8_t s_eventWrite;
@@ -33,9 +48,9 @@ static nxp_host_report_t s_reports[REPORT_QUEUE_CAPACITY];
 static volatile uint8_t s_reportRead;
 static volatile uint8_t s_reportWrite;
 static uint32_t s_reportSequence;
-static volatile uint8_t s_receiveArmed;
 
 static void HidReceiveCallback(void *param, uint8_t *data, uint32_t dataLen, usb_status_t status);
+static void StartNextHidInterface(void);
 
 static void PushEvent(const nxp_host_event_t *event)
 {
@@ -94,7 +109,18 @@ static uint16_t FindReportDescriptorLength(const usb_host_interface_t *interface
     return 0U;
 }
 
-static void PushDescriptorEvent(usb_status_t status, uint32_t descriptorLength)
+static void FillSlotEvent(nxp_host_event_t *event, const hid_slot_t *slot)
+{
+    event->interfaceNumber   = slot->interfaceNumber;
+    event->interfaceSubclass = slot->interfaceSubclass;
+    event->interfaceProtocol = slot->interfaceProtocol;
+    event->interfaceIndex    = slot->interfaceIndex;
+    event->endpointAddress   = slot->endpointAddress;
+    event->interval          = slot->interval;
+    event->maxPacketSize     = slot->packetSize;
+}
+
+static void PushDescriptorEvent(hid_slot_t *slot, usb_status_t status, uint32_t descriptorLength)
 {
     nxp_host_event_t descriptorEvent = {0};
 
@@ -104,52 +130,67 @@ static void PushDescriptorEvent(usb_status_t status, uint32_t descriptorLength)
     }
     if (status == kStatus_USB_Success)
     {
-        s_reportDescriptorActualLength = (uint16_t)descriptorLength;
+        slot->reportDescriptorActualLength = (uint16_t)descriptorLength;
     }
     descriptorEvent.kind          = NXP_HOST_EVENT_REPORT_DESCRIPTOR;
     descriptorEvent.status        = (uint8_t)status;
     descriptorEvent.maxPacketSize = (uint16_t)descriptorLength;
+    FillSlotEvent(&descriptorEvent, slot);
+    descriptorEvent.maxPacketSize = (uint16_t)descriptorLength;
     PushEvent(&descriptorEvent);
 }
 
-static void StartHidReceive(void)
+static void StartHidReceive(hid_slot_t *slot)
 {
     nxp_host_event_t readyEvent = {0};
     usb_status_t receiveStatus  = kStatus_USB_Error;
 
-    if ((s_hidClass != NULL) && (s_hidPacketSize != 0U) &&
-        (s_hidPacketSize <= HID_RX_BUFFER_SIZE))
+    if ((slot->classHandle != NULL) && (slot->packetSize != 0U) &&
+        (slot->packetSize <= HID_RX_BUFFER_SIZE))
     {
-        receiveStatus =
-            USB_HostHidRecv(s_hidClass, s_hidRxBuffer, s_hidPacketSize, HidReceiveCallback, NULL);
+        receiveStatus = USB_HostHidRecv(slot->classHandle,
+                                        s_hidRxBuffers[slot->interfaceIndex],
+                                        slot->packetSize,
+                                        HidReceiveCallback,
+                                        slot);
         if (receiveStatus == kStatus_USB_Success)
         {
-            s_receiveArmed = 1U;
+            slot->receiveArmed = 1U;
         }
     }
     readyEvent.kind   = NXP_HOST_EVENT_HID_READY;
     readyEvent.status = (uint8_t)receiveStatus;
+    FillSlotEvent(&readyEvent, slot);
     PushEvent(&readyEvent);
 }
 
 static void HidDescriptorCallback(void *param, uint8_t *data, uint32_t dataLen, usb_status_t status)
 {
-    (void)param;
+    hid_slot_t *slot = (hid_slot_t *)param;
     (void)data;
-    PushDescriptorEvent(status, dataLen);
+    if (slot->occupied != 0U)
+    {
+        PushDescriptorEvent(slot, status, dataLen);
+        StartNextHidInterface();
+    }
 }
 
 static void HidReceiveCallback(void *param, uint8_t *data, uint32_t dataLen, usb_status_t status)
 {
     nxp_host_report_t report = {0};
+    hid_slot_t *slot = (hid_slot_t *)param;
     uint32_t index;
     uint32_t length = dataLen;
-    (void)param;
 
     /* The NXP class frees this transfer after returning from the callback.
      * Defer requeueing to nxp_host_task(), where the transfer object is back
      * in the pool and concurrent control requests cannot starve the requeue. */
-    s_receiveArmed = 0U;
+    slot->receiveArmed = 0U;
+
+    if (slot->occupied == 0U)
+    {
+        return;
+    }
 
     if (length > REPORT_DATA_CAPACITY)
     {
@@ -158,6 +199,8 @@ static void HidReceiveCallback(void *param, uint8_t *data, uint32_t dataLen, usb
     report.sequence = ++s_reportSequence;
     report.length   = (uint8_t)length;
     report.status   = (uint8_t)status;
+    report.interfaceNumber = slot->interfaceNumber;
+    report.interfaceIndex  = slot->interfaceIndex;
     for (index = 0U; index < length; ++index)
     {
         report.data[index] = data[index];
@@ -168,39 +211,83 @@ static void HidReceiveCallback(void *param, uint8_t *data, uint32_t dataLen, usb
 
 static void HidInterfaceCallback(void *param, uint8_t *data, uint32_t dataLen, usb_status_t status)
 {
+    hid_slot_t *slot = (hid_slot_t *)param;
     usb_status_t descriptorStatus;
-    (void)param;
     (void)data;
     (void)dataLen;
 
     if (status != kStatus_USB_Success)
     {
-        PushDescriptorEvent(status, 0U);
-        StartHidReceive();
+        nxp_host_event_t readyEvent = {0};
+        readyEvent.kind             = NXP_HOST_EVENT_HID_READY;
+        readyEvent.status           = (uint8_t)status;
+        FillSlotEvent(&readyEvent, slot);
+        PushEvent(&readyEvent);
+        PushDescriptorEvent(slot, status, 0U);
+        StartNextHidInterface();
         return;
     }
 
     /* Preserve the known-good receive timing: queue Interrupt IN as soon as
      * SET_INTERFACE completes. The report-descriptor control request uses a
      * different pipe and may run concurrently. */
-    StartHidReceive();
+    StartHidReceive(slot);
 
-    if ((s_hidClass != NULL) && (s_reportDescriptorLength != 0U) &&
-        (s_reportDescriptorLength <= HID_REPORT_DESCRIPTOR_CAPACITY))
+    if ((slot->classHandle != NULL) && (slot->reportDescriptorLength != 0U) &&
+        (slot->reportDescriptorLength <= HID_REPORT_DESCRIPTOR_CAPACITY))
     {
-        descriptorStatus = USB_HostHidGetReportDescriptor(s_hidClass,
-                                                          s_reportDescriptor,
-                                                          s_reportDescriptorLength,
+        descriptorStatus = USB_HostHidGetReportDescriptor(slot->classHandle,
+                                                          s_reportDescriptors[slot->interfaceIndex],
+                                                          slot->reportDescriptorLength,
                                                           HidDescriptorCallback,
-                                                          NULL);
+                                                          slot);
         if (descriptorStatus == kStatus_USB_Success)
         {
             return;
         }
-        PushDescriptorEvent(descriptorStatus, 0U);
+        PushDescriptorEvent(slot, descriptorStatus, 0U);
+        StartNextHidInterface();
         return;
     }
-    PushDescriptorEvent(kStatus_USB_Error, 0U);
+    PushDescriptorEvent(slot, kStatus_USB_Error, 0U);
+    StartNextHidInterface();
+}
+
+static void StartNextHidInterface(void)
+{
+    uint8_t index;
+    for (index = 0U; index < MAX_HID_INTERFACES; ++index)
+    {
+        hid_slot_t *slot = &s_hidSlots[index];
+        usb_host_interface_t *interface;
+        usb_status_t status;
+        if ((slot->occupied == 0U) || (slot->openStarted != 0U))
+        {
+            continue;
+        }
+        slot->openStarted = 1U;
+        interface = (usb_host_interface_t *)slot->interfaceHandle;
+        status = USB_HostHidInit(s_hidDevice, &slot->classHandle);
+        if (status == kStatus_USB_Success)
+        {
+            status = USB_HostHidSetInterface(slot->classHandle,
+                                             slot->interfaceHandle,
+                                             interface->interfaceDesc->bAlternateSetting,
+                                             HidInterfaceCallback,
+                                             slot);
+        }
+        if (status != kStatus_USB_Success)
+        {
+            nxp_host_event_t readyEvent = {0};
+            readyEvent.kind             = NXP_HOST_EVENT_HID_READY;
+            readyEvent.status           = (uint8_t)status;
+            FillSlotEvent(&readyEvent, slot);
+            PushEvent(&readyEvent);
+            PushDescriptorEvent(slot, status, 0U);
+            continue;
+        }
+        return;
+    }
 }
 
 static uint32_t GetInfo(usb_device_handle device, usb_host_dev_info_t code)
@@ -222,107 +309,108 @@ static usb_status_t HostEvent(usb_device_handle device,
     {
         case kUSB_HostEventAttach:
         {
-            usb_host_interface_t *candidate = NULL;
+            uint8_t hidFound = 0U;
             configuration = (usb_host_configuration_t *)configurationHandle;
             for (interfaceIndex = 0U; interfaceIndex < configuration->interfaceCount; ++interfaceIndex)
             {
                 usb_host_interface_t *interface = &configuration->interfaceList[interfaceIndex];
                 if (interface->interfaceDesc->bInterfaceClass == USB_HOST_HID_CLASS_CODE)
                 {
-                    if (candidate == NULL)
-                    {
-                        candidate = interface;
-                    }
-                    if (interface->interfaceDesc->bInterfaceProtocol == USB_HOST_HID_PROTOCOL_MOUSE)
-                    {
-                        candidate = interface;
-                        break;
-                    }
+                    hidFound = 1U;
+                    break;
                 }
             }
-            if (candidate == NULL)
+            if (hidFound == 0U)
             {
                 return kStatus_USB_NotSupported;
             }
             s_hidDevice        = device;
             s_hidConfiguration = configurationHandle;
-            s_hidInterface     = candidate;
             return kStatus_USB_Success;
         }
 
         case kUSB_HostEventEnumerationDone:
             if ((device == s_hidDevice) && (configurationHandle == s_hidConfiguration))
             {
-                nxp_host_event_t event = {0};
-                usb_host_interface_t *interface = (usb_host_interface_t *)s_hidInterface;
-                usb_status_t status;
-                event.kind       = NXP_HOST_EVENT_HID_ATTACHED;
-                event.speed      = (uint8_t)GetInfo(device, kUSB_HostGetDeviceSpeed);
-                event.address    = (uint8_t)GetInfo(device, kUSB_HostGetDeviceAddress);
-                event.hubAddress = (uint8_t)GetInfo(device, kUSB_HostGetDeviceHubNumber);
-                event.hubPort    = (uint8_t)GetInfo(device, kUSB_HostGetDevicePortNumber);
-                event.vid        = (uint16_t)GetInfo(device, kUSB_HostGetDeviceVID);
-                event.pid        = (uint16_t)GetInfo(device, kUSB_HostGetDevicePID);
-                event.interfaceNumber   = interface->interfaceDesc->bInterfaceNumber;
-                event.interfaceSubclass = interface->interfaceDesc->bInterfaceSubClass;
-                event.interfaceProtocol = interface->interfaceDesc->bInterfaceProtocol;
-
-                for (endpointIndex = 0U; endpointIndex < interface->epCount; ++endpointIndex)
+                uint8_t slotIndex = 0U;
+                configuration = (usb_host_configuration_t *)configurationHandle;
+                for (interfaceIndex = 0U;
+                     (interfaceIndex < configuration->interfaceCount) &&
+                     (slotIndex < MAX_HID_INTERFACES);
+                     ++interfaceIndex)
                 {
-                    usb_descriptor_endpoint_t *ep = interface->epList[endpointIndex].epDesc;
-                    if (((ep->bmAttributes & USB_DESCRIPTOR_ENDPOINT_ATTRIBUTE_TYPE_MASK) ==
-                         USB_ENDPOINT_INTERRUPT) &&
-                        ((ep->bEndpointAddress & USB_DESCRIPTOR_ENDPOINT_ADDRESS_DIRECTION_MASK) != 0U))
+                    usb_host_interface_t *interface = &configuration->interfaceList[interfaceIndex];
+                    hid_slot_t *slot;
+                    nxp_host_event_t event = {0};
+                    if (interface->interfaceDesc->bInterfaceClass != USB_HOST_HID_CLASS_CODE)
                     {
-                        event.endpointAddress = ep->bEndpointAddress;
-                        event.interval        = ep->bInterval;
-                        event.maxPacketSize   = USB_SHORT_FROM_LITTLE_ENDIAN_ADDRESS(ep->wMaxPacketSize);
-                        break;
+                        continue;
                     }
+                    slot = &s_hidSlots[slotIndex];
+                    *slot = (hid_slot_t){0};
+                    slot->interfaceIndex = slotIndex;
+                    slot->interfaceNumber = interface->interfaceDesc->bInterfaceNumber;
+                    slot->interfaceSubclass = interface->interfaceDesc->bInterfaceSubClass;
+                    slot->interfaceProtocol = interface->interfaceDesc->bInterfaceProtocol;
+                    slot->interfaceHandle = interface;
+                    slot->reportDescriptorLength = FindReportDescriptorLength(interface);
+                    for (endpointIndex = 0U; endpointIndex < interface->epCount; ++endpointIndex)
+                    {
+                        usb_descriptor_endpoint_t *ep = interface->epList[endpointIndex].epDesc;
+                        if (((ep->bmAttributes & USB_DESCRIPTOR_ENDPOINT_ATTRIBUTE_TYPE_MASK) ==
+                             USB_ENDPOINT_INTERRUPT) &&
+                            ((ep->bEndpointAddress & USB_DESCRIPTOR_ENDPOINT_ADDRESS_DIRECTION_MASK) != 0U))
+                        {
+                            slot->endpointAddress = ep->bEndpointAddress;
+                            slot->interval        = ep->bInterval;
+                            slot->packetSize =
+                                USB_SHORT_FROM_LITTLE_ENDIAN_ADDRESS(ep->wMaxPacketSize);
+                            break;
+                        }
+                    }
+                    if ((slot->endpointAddress == 0U) || (slot->packetSize == 0U))
+                    {
+                        *slot = (hid_slot_t){0};
+                        continue;
+                    }
+                    slot->occupied = 1U;
+                    event.kind       = NXP_HOST_EVENT_HID_ATTACHED;
+                    event.speed      = (uint8_t)GetInfo(device, kUSB_HostGetDeviceSpeed);
+                    event.address    = (uint8_t)GetInfo(device, kUSB_HostGetDeviceAddress);
+                    event.hubAddress = (uint8_t)GetInfo(device, kUSB_HostGetDeviceHubNumber);
+                    event.hubPort    = (uint8_t)GetInfo(device, kUSB_HostGetDevicePortNumber);
+                    event.vid        = (uint16_t)GetInfo(device, kUSB_HostGetDeviceVID);
+                    event.pid        = (uint16_t)GetInfo(device, kUSB_HostGetDevicePID);
+                    FillSlotEvent(&event, slot);
+                    PushEvent(&event);
+                    ++slotIndex;
                 }
-                PushEvent(&event);
-
-                s_hidPacketSize = event.maxPacketSize;
-                s_reportDescriptorLength = FindReportDescriptorLength(interface);
-                s_reportDescriptorActualLength = 0U;
-                status = USB_HostHidInit(device, &s_hidClass);
-                if (status == kStatus_USB_Success)
-                {
-                    status = USB_HostHidSetInterface(s_hidClass,
-                                                     s_hidInterface,
-                                                     interface->interfaceDesc->bAlternateSetting,
-                                                     HidInterfaceCallback,
-                                                     NULL);
-                }
-                if (status != kStatus_USB_Success)
-                {
-                    nxp_host_event_t readyEvent = {0};
-                    readyEvent.kind             = NXP_HOST_EVENT_HID_READY;
-                    readyEvent.status           = (uint8_t)status;
-                    PushEvent(&readyEvent);
-                }
+                StartNextHidInterface();
             }
             return kStatus_USB_Success;
 
         case kUSB_HostEventDetach:
             if (device == s_hidDevice)
             {
+                uint8_t index;
                 nxp_host_event_t event = {0};
-                usb_host_class_handle classHandle = s_hidClass;
                 event.kind             = NXP_HOST_EVENT_DETACHED;
                 PushEvent(&event);
-                s_hidClass         = NULL;
-                s_hidPacketSize    = 0U;
-                s_receiveArmed     = 0U;
-                s_reportDescriptorLength       = 0U;
-                s_reportDescriptorActualLength = 0U;
-                if (classHandle != NULL)
+                for (index = 0U; index < MAX_HID_INTERFACES; ++index)
                 {
-                    (void)USB_HostHidDeinit(device, classHandle);
+                    hid_slot_t *slot = &s_hidSlots[index];
+                    usb_host_class_handle classHandle = slot->classHandle;
+                    slot->occupied = 0U;
+                    slot->receiveArmed = 0U;
+                    slot->classHandle = NULL;
+                    if (classHandle != NULL)
+                    {
+                        (void)USB_HostHidDeinit(device, classHandle);
+                    }
+                    *slot = (hid_slot_t){0};
                 }
                 s_hidDevice        = NULL;
                 s_hidConfiguration = NULL;
-                s_hidInterface     = NULL;
             }
             return kStatus_USB_Success;
 
@@ -353,14 +441,24 @@ int32_t nxp_host_init(void)
 
 void nxp_host_task(void)
 {
+    uint8_t index;
     USB_HostEhciTaskFunction(s_hostHandle);
-    if ((s_hidClass != NULL) && (s_hidPacketSize != 0U) && (s_receiveArmed == 0U))
+    for (index = 0U; index < MAX_HID_INTERFACES; ++index)
     {
-        usb_status_t status =
-            USB_HostHidRecv(s_hidClass, s_hidRxBuffer, s_hidPacketSize, HidReceiveCallback, NULL);
-        if (status == kStatus_USB_Success)
+        hid_slot_t *slot = &s_hidSlots[index];
+        if ((slot->occupied != 0U) && (slot->classHandle != NULL) &&
+            (slot->packetSize != 0U) && (slot->packetSize <= HID_RX_BUFFER_SIZE) &&
+            (slot->receiveArmed == 0U))
         {
-            s_receiveArmed = 1U;
+            usb_status_t status = USB_HostHidRecv(slot->classHandle,
+                                                  s_hidRxBuffers[index],
+                                                  slot->packetSize,
+                                                  HidReceiveCallback,
+                                                  slot);
+            if (status == kStatus_USB_Success)
+            {
+                slot->receiveArmed = 1U;
+            }
         }
     }
 }
@@ -397,17 +495,24 @@ int32_t nxp_host_pop_report(nxp_host_report_t *report)
     return 1;
 }
 
-int32_t nxp_host_copy_report_descriptor(uint8_t *buffer, uint16_t capacity)
+int32_t nxp_host_copy_report_descriptor(uint8_t interfaceIndex, uint8_t *buffer, uint16_t capacity)
 {
-    uint16_t length = s_reportDescriptorActualLength;
+    hid_slot_t *slot;
+    uint16_t length;
     uint16_t index;
-    if ((buffer == NULL) || (length == 0U) || (capacity < length))
+    if (interfaceIndex >= MAX_HID_INTERFACES)
+    {
+        return 0;
+    }
+    slot = &s_hidSlots[interfaceIndex];
+    length = slot->reportDescriptorActualLength;
+    if ((slot->occupied == 0U) || (buffer == NULL) || (length == 0U) || (capacity < length))
     {
         return 0;
     }
     for (index = 0U; index < length; ++index)
     {
-        buffer[index] = s_reportDescriptor[index];
+        buffer[index] = s_reportDescriptors[interfaceIndex][index];
     }
     return (int32_t)length;
 }
@@ -437,4 +542,9 @@ int32_t nxp_device_init_clocks(void)
      * peripheral gate. */
     CCM->CCGR6 |= CCM_CCGR6_CG0_MASK;
     return 0;
+}
+
+uint32_t nxp_core_clock_hz(void)
+{
+    return SystemCoreClock;
 }

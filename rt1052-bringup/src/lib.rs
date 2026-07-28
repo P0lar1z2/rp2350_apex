@@ -15,6 +15,15 @@ pub mod hid_device;
 #[cfg(feature = "nxp-device")]
 pub mod runtime_hid;
 
+#[cfg(feature = "nxp-device")]
+#[path = "../../src/macro_engine.rs"]
+pub mod macro_engine;
+
+#[cfg(feature = "nxp-device")]
+pub mod macro_config {
+    include!(concat!(env!("OUT_DIR"), "/macro_config.rs"));
+}
+
 /// Marks firmware that relies on the RT1052 reset-time default RAM partition.
 ///
 /// Keeping this call in binaries also retains this crate's native-link

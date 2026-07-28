@@ -118,11 +118,15 @@ def elf_image(path: Path) -> tuple[int, int, list[tuple[int, bytes]]]:
     segments: list[tuple[int, bytes]] = []
     for index in range(phnum):
         header = phoff + index * phentsize
-        p_type, offset, address, _, file_size, _ = struct.unpack_from(
+        p_type, offset, _, load_address, file_size, _ = struct.unpack_from(
             "<IIIIII", image, header
         )
         if p_type == 1 and file_size:
-            segments.append((address, image[offset : offset + file_size]))
+            # Cortex-M images can give .data a RAM virtual address and a
+            # distinct ITCM load address. Reset copies from p_paddr to
+            # p_vaddr, so a RAM-only loader must populate p_paddr just like a
+            # flash programmer would.
+            segments.append((load_address, image[offset : offset + file_size]))
     initial_sp = struct.unpack_from("<I", segments[0][1], 0)[0]
     return entry, initial_sp, segments
 
@@ -137,8 +141,21 @@ def connect(port: int) -> socket.socket:
     raise RuntimeError("probe-rs GDB server did not start")
 
 
-def drain_rtt(rsp: Rsp) -> bytes:
-    base = 0x2000_0000
+def elf_symbol(path: Path, name: str) -> int | None:
+    try:
+        symbols = subprocess.check_output(
+            ["arm-none-eabi-nm", "-n", str(path)], text=True
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    for line in symbols.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[-1] == name:
+            return int(fields[0], 16)
+    return None
+
+
+def drain_rtt(rsp: Rsp, base: int) -> bytes:
     header = rsp.read(base, 48)
     if not header.startswith(b"SEGGER RTT"):
         return b""
@@ -166,6 +183,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     entry, initial_sp, segments = elf_image(args.elf)
+    rtt_base = elf_symbol(args.elf, "_SEGGER_RTT") or 0x2000_0000
 
     command = [
         "probe-rs",
@@ -208,7 +226,7 @@ def main() -> int:
             # noticeably more reliable when we halt only once for inspection.
             time.sleep(args.seconds)
             rsp.halt()
-            output = drain_rtt(rsp)
+            output = drain_rtt(rsp, rtt_base)
             if output:
                 print(output.decode(errors="replace"), end="", flush=True)
             gpr14 = struct.unpack("<I", rsp.read(0x400A_C038, 4))[0]
