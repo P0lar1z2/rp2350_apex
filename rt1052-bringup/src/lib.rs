@@ -5,6 +5,9 @@ pub mod hid_report;
 
 pub mod control_protocol;
 
+#[cfg(feature = "nxp-enet")]
+pub mod enet_device;
+
 #[cfg(feature = "nxp-device")]
 pub mod usb_host {
     pub use crate::hid_report::*;

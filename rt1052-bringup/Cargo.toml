@@ -7,7 +7,7 @@ publish = false
 [features]
 default = []
 nxp-host = []
-nxp-enet = []
+nxp-enet = ["dep:smoltcp"]
 nxp-device = ["dep:imxrt-ral", "dep:imxrt-usbd", "dep:usb-device"]
 
 [dependencies]
@@ -19,6 +19,7 @@ rtt-target = "0.6.2"
 imxrt-ral = { version = "0.6.2", features = ["imxrt1052"], optional = true }
 imxrt-usbd = { version = "0.4.2", optional = true }
 usb-device = { version = "0.3.2", features = ["control-buffer-256"], optional = true }
+smoltcp = { version = "0.13.1", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-udp"], optional = true }
 
 [build-dependencies]
 regex = "1.11.0"

@@ -95,4 +95,5 @@
 - Ethernet 实测：ENET PLL 锁定；MDIO 读取 `ID1=0x0007`、`ID2=0xC0F1`，确认 LAN8720A；探针运行时 BMSR Link 位为 0（PHY 在线，未建立网线链路）。
 - ENET DMA 实测：NXP ENET 初始化成功，非缓存 OCRAM 中的 5 RX / 3 TX 描述符环已建立；无网线时状态轮询稳定为 Link Down，收包计数为 0。
 - 异步控制协议：已定义无分配 `RTCP` v1 报文、启停/切层/触发/释放/全释放命令、异步 ACK 编码和满载即丢新命令的有界队列；待接 UDP/IP。
+- Rust 网络适配：已将 NXP ENET 的轮询式收发封装为 `smoltcp` 0.13.1 `Device`，保持 no_std、无堆分配；待建立静态 IPv4/UDP socket。
 - 下一步：接入轻量 UDP/IP 并在网线 Link Up 后验收收发；连接下游键盘后补做宏触发实机验收。
