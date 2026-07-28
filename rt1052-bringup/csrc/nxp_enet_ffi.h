@@ -18,5 +18,7 @@ int32_t nxp_enet_init(void);
 int32_t nxp_enet_status(nxp_enet_status_t *status);
 int32_t nxp_enet_receive(uint8_t *frame, uint32_t capacity);
 int32_t nxp_enet_send(const uint8_t *frame, uint32_t length);
+int32_t nxp_enet_set_phy_loopback(uint8_t enable);
+uint32_t nxp_enet_cpu_hz(void);
 
 #endif

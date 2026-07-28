@@ -23,6 +23,7 @@ unsafe extern "C" {
     fn nxp_enet_status(status: *mut EnetStatus) -> c_int;
     fn nxp_enet_receive(frame: *mut u8, capacity: u32) -> c_int;
     fn nxp_enet_send(frame: *const u8, length: u32) -> c_int;
+    fn nxp_enet_cpu_hz() -> u32;
 }
 
 pub struct EnetDevice;
@@ -42,6 +43,11 @@ impl EnetDevice {
     }
 }
 
+pub fn cpu_hz() -> u32 {
+    // SAFETY: The SDK clock query only reads clock-control registers.
+    unsafe { nxp_enet_cpu_hz() }
+}
+
 pub struct EnetRxToken {
     frame: [u8; FRAME_CAPACITY],
     length: usize,
@@ -57,7 +63,13 @@ impl Device for EnetDevice {
         let mut frame = [0u8; FRAME_CAPACITY];
         // SAFETY: frame is writable for FRAME_CAPACITY bytes.
         let length = unsafe { nxp_enet_receive(frame.as_mut_ptr(), FRAME_CAPACITY as u32) };
-        (length > 0).then_some((EnetRxToken { frame, length: length as usize }, EnetTxToken))
+        (length > 0).then_some((
+            EnetRxToken {
+                frame,
+                length: length as usize,
+            },
+            EnetTxToken,
+        ))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {

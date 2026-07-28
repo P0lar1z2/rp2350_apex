@@ -80,8 +80,8 @@ class Rsp:
         self.no_ack = True
 
     def write(self, address: int, data: bytes) -> None:
-        for offset in range(0, len(data), 64):
-            part = data[offset : offset + 64]
+        for offset in range(0, len(data), 256):
+            part = data[offset : offset + 256]
             response = self.command(
                 f"M{address + offset:x},{len(part):x}:{part.hex()}"
             )
@@ -176,6 +176,7 @@ def main() -> int:
     parser.add_argument("--seconds", type=float, default=3)
     parser.add_argument("--speed", type=int, default=50)
     parser.add_argument("--port", type=int, default=1337)
+    parser.add_argument("--no-verify", action="store_true")
     parser.add_argument(
         "--connect-under-reset",
         action="store_true",
@@ -214,8 +215,14 @@ def main() -> int:
             rsp.start_no_ack()
             for address, data in segments:
                 rsp.write(address, data)
-                if rsp.read(address, len(data)) != data:
-                    raise RuntimeError(f"ELF verification failed at 0x{address:08x}")
+                if args.no_verify:
+                    continue
+                for offset in range(0, len(data), 256):
+                    part = data[offset : offset + 256]
+                    if rsp.read(address + offset, len(part)) != part:
+                        raise RuntimeError(
+                            f"ELF verification failed at 0x{address + offset:08x}"
+                        )
             rsp.set_register(GDB_REG_SP, initial_sp)
             rsp.set_register(GDB_REG_MSP, initial_sp)
             rsp.set_register(GDB_REG_PC, entry)
@@ -232,15 +239,26 @@ def main() -> int:
             gpr14 = struct.unpack("<I", rsp.read(0x400A_C038, 4))[0]
             gpr16 = struct.unpack("<I", rsp.read(0x400A_C040, 4))[0]
             gpr17 = struct.unpack("<I", rsp.read(0x400A_C044, 4))[0]
+            gpr1 = struct.unpack("<I", rsp.read(0x400A_C004, 4))[0]
+            enet_pll = struct.unpack("<I", rsp.read(0x400D_80E0, 4))[0]
             dma = rsp.read(0x2020_0000, 32)
             enet_tx_bd = rsp.read(0x2020_0040, 24)
+            rx_frames = []
+            for index in range(4):
+                length, control, buffer = struct.unpack_from("<HHI", dma, index * 8)
+                head = rsp.read(buffer, min(length, 32)) if buffer and length else b""
+                rx_frames.append(
+                    f"rx{index}=len:{length},ctrl:0x{control:04x},"
+                    f"buf:0x{buffer:08x},head:{head.hex()}"
+                )
             print(
                 f"state: pc=0x{rsp.get_register(GDB_REG_PC):08x} "
                 f"sp=0x{rsp.get_register(GDB_REG_SP):08x} "
                 f"xpsr=0x{rsp.get_register(GDB_REG_XPSR):08x} "
                 f"gpr14=0x{gpr14:08x} gpr16=0x{gpr16:08x} "
-                f"gpr17=0x{gpr17:08x} dma={dma.hex()} "
-                f"enet_tx_bd={enet_tx_bd.hex()}"
+                f"gpr17=0x{gpr17:08x} gpr1=0x{gpr1:08x} "
+                f"enet_pll=0x{enet_pll:08x} dma={dma.hex()} "
+                f"enet_tx_bd={enet_tx_bd.hex()} " + " ".join(rx_frames)
             )
             success = True
     finally:

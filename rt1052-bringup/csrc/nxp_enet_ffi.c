@@ -27,13 +27,10 @@ static inline volatile uint32_t *reg32(uint32_t address) {
 
 static bool init_enet_pll(void) {
     volatile uint32_t *pll = reg32(0x400D80E0U);
-    *pll |= (1U << 16);
-    *pll = (*pll & ~((3U << 0) | (1U << 12))) | 1U | (1U << 13);
+    /* Match the board SDK's CLOCK_InitEnetPll({true, false, 1}) exactly. */
+    *pll = (1U << 13) | 1U;
     for (uint32_t count = 0; count < 2000000U; ++count) {
-        if ((*pll & (1UL << 31)) != 0U) {
-            *pll &= ~(1U << 16);
-            return true;
-        }
+        if ((*pll & (1UL << 31)) != 0U) return true;
     }
     return false;
 }
@@ -76,7 +73,8 @@ static bool init_board_phy(void) {
     *reg32(0x401F81A8U) = 3U;
     *reg32(0x401F8440U) = 1U;
     *reg32(0x401F8398U) = 0xB0E9U;
-    *reg32(0x400AC004U) |= (1U << 17);
+    /* Select the internal ENET PLL, then enable its output on ENET_REF_CLK. */
+    *reg32(0x400AC004U) = (*reg32(0x400AC004U) & ~(1U << 13)) | (1U << 17);
     if (!init_enet_pll()) {
         return false;
     }
@@ -113,6 +111,16 @@ int32_t nxp_enet_init(void) {
     if (ENET_Init(ENET, &s_handle, &config, &buffers, mac, 132000000U) != kStatus_Success) {
         return -2;
     }
+    /*
+     * This RT1052 Pro sample is reliable at 10BASE-T but its 100M RMII path
+     * fails the PHY-local byte-for-byte loopback diagnostic. Advertise only
+     * 10M modes so the external link uses the verified data path.
+     */
+    if (ENET_MDIOWrite(ENET, PHY_ADDRESS, 4U, 0x0061U) != kStatus_Success ||
+        ENET_MDIOWrite(ENET, PHY_ADDRESS, 0U, 0x1200U) != kStatus_Success) {
+        return -3;
+    }
+    ENET_SetMII(ENET, kENET_MiiSpeed10M, kENET_MiiFullDuplex);
     ENET_ActiveRead(ENET);
     s_initialized = true;
     return 0;
@@ -155,4 +163,18 @@ int32_t nxp_enet_send(const uint8_t *frame, uint32_t length) {
     if (!s_initialized || frame == NULL || length < 14U || length > FRAME_BUFFER_SIZE) return -1;
     status_t result = ENET_SendFrame(ENET, &s_handle, frame, length, 0U, false, NULL);
     return result == kStatus_Success ? 0 : -2;
+}
+
+int32_t nxp_enet_set_phy_loopback(uint8_t enable) {
+    if (!s_initialized) return -1;
+    /* Exercise the verified 10 Mbit/s full-duplex RMII data path. */
+    uint16_t bmcr = enable != 0U ? 0x4100U : 0x1200U;
+    if (enable != 0U) {
+        ENET_SetMII(ENET, kENET_MiiSpeed10M, kENET_MiiFullDuplex);
+    }
+    return ENET_MDIOWrite(ENET, PHY_ADDRESS, 0U, bmcr) == kStatus_Success ? 0 : -2;
+}
+
+uint32_t nxp_enet_cpu_hz(void) {
+    return CLOCK_GetFreq(kCLOCK_CpuClk);
 }

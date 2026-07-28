@@ -46,6 +46,11 @@ path = "src/bin/enet_control.rs"
 required-features = ["nxp-enet"]
 
 [[bin]]
+name = "enet_loopback"
+path = "src/bin/enet_loopback.rs"
+required-features = ["nxp-enet"]
+
+[[bin]]
 name = "device_hid"
 path = "src/bin/device_hid.rs"
 required-features = ["nxp-host", "nxp-device"]

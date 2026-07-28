@@ -57,8 +57,8 @@
 ### 4. Ethernet 控制
 
 - [x] 通过 MDIO 探针确认板载 LAN8720A 的 PHY ID、地址和链路状态。
-- [ ] 接入 ENET DMA 和网络栈。
-- [ ] 接入 DHCP + UDP `RTCP` v1 异步控制协议：网络收包只入有界队列，USB 路径不等待网络。
+- [x] 接入 ENET DMA 和网络栈。
+- [x] 接入 DHCP + UDP `RTCP` v1 异步控制协议：网络收包只入有界队列，USB 路径不等待网络。
 - [ ] USB Host 中断优先级高于 USB Device，高于 ENET。
 - [ ] 网络协议只发送控制事件，不进入 USB 中断路径；异步 ACK 在拥塞时允许丢弃。
 - [ ] 在满载网络流量下复测 8K USB，不允许出现持续丢报告或降频。
@@ -90,11 +90,11 @@
 - 实测热插拔：下游接收器拔出后 OTG1 立即停止，上游 Linux 设备消失；插回后逐项核验 VID/PID、接口参数及 71/185 字节 Report Descriptor，一致时自动重新连接，Linux 设备号从 77 更新为 78 且两个 `usbhid` 接口恢复。
 - RAM runner 修复：按 ELF `p_paddr` 加载 `.data` 初值，并从 ELF `_SEGGER_RTT` 符号定位日志控制块，避免链接布局变化导致静态初值或 RTT 读取错误。
 - 当前动态克隆范围：克隆最多 4 个带 Interrupt IN 的 HID 接口；暂未克隆原始字符串、Interrupt OUT，键盘 LED `SET_REPORT` 当前只确认接收不向下游转发；热插拔后仍需重新枚举 OTG1。
-- 当前阻塞：路由器尚未向合法 DHCP DISCOVER 返回 OFFER，需检查 LAN 端口/DHCP 策略及 MAC `02:10:52:00:00:01`。
 - Ethernet 板级参数：Pro 底板使用 LAN8720 系列 PHY，MDIO 地址 0；GPIO1_IO09 为复位，GPIO1_IO10 需在复位前拉高；RT1052 从 GPIO_B1_10 输出 50 MHz RMII REF_CLK。
-- Ethernet 实测：ENET PLL 锁定；MDIO 读取 `ID1=0x0007`、`ID2=0xC0F1`，确认 LAN8720A；探针运行时 BMSR Link 位为 0（PHY 在线，未建立网线链路）。
+- Ethernet 实测：ENET PLL 锁定；MDIO 读取 `ID1=0x0007`、`ID2=0xC0F1`，确认 LAN8720A；10M Full-Duplex 链路已建立。
 - ENET DMA 实测：NXP ENET 初始化成功，OCRAM 中的 5 RX / 3 TX 描述符环已建立；第一版 ENET 启动前关闭 D-Cache（保留 I-Cache）保证 BD/DMA 一致，后续改为 MPU non-cache 分区。
+- RMII 诊断：100M PHY 本地回环会出现帧长和字节损坏；10M 本地回环的 60 字节测试帧逐字节一致，因此当前只通告 10BASE-T Half/Full，避免使用未通过验证的 100M 数据路径。
 - 异步控制协议：已定义无分配 `RTCP` v1 报文、启停/切层/触发/释放/全释放命令、异步 ACK 编码和满载即丢新命令的有界队列；UDP 1052 socket 已接入。
 - Rust 网络适配：已将 NXP ENET 的轮询式收发封装为 `smoltcp` 0.13.1 `Device`，保持 no_std、无堆分配，并加入 DHCPv4 与 UDP socket。
-- DHCP 控制固件：启动后广播 DHCP DISCOVER，获得租约后才启用 UDP 1052；实测 304 字节 DISCOVER 内容正确且 TX DMA 完成，但当前路由器未返回 OFFER，待检查 MAC `02:10:52:00:00:01` 的 DHCP/端口策略。
-- 下一步：取得 DHCP 租约后验收 UDP `RTCP` 命令/异步 ACK，再将控制队列接入桥接固件；连接下游键盘后补做宏触发实机验收。
+- DHCP 控制固件：等待 PHY 链路后广播 DHCP DISCOVER，获得租约后才启用 UDP 1052；实测 MAC `02:10:52:00:00:01` 获得 `192.168.110.52/24`，网关 `192.168.110.1`。
+- 下一步：验收 UDP `RTCP` 命令/异步 ACK，再将控制队列接入桥接固件；连接下游键盘后补做宏触发实机验收。

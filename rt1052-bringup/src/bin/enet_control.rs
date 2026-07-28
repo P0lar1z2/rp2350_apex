@@ -15,33 +15,38 @@ use rt1052_bringup::control_protocol::{self, ControlQueue};
 use rt1052_bringup::enet_device::EnetDevice;
 
 const UDP_PORT: u16 = 1052;
-const CORE_HZ: u64 = 528_000_000;
-
 struct CycleClock {
+    cycles_per_ms: u64,
     last: u32,
     total: u64,
 }
 
 impl CycleClock {
-    fn new() -> Self {
-        const DEMCR: usize = 0xE000_EDFC;
-        const DWT_CTRL: usize = 0xE000_1000;
-        const DWT_CYCCNT: usize = 0xE000_1004;
-        // SAFETY: These are the Cortex-M7 trace and DWT cycle counter registers.
+    fn new(core_hz: u32) -> Self {
+        const SYST_CSR: usize = 0xE000_E010;
+        const SYST_RVR: usize = 0xE000_E014;
+        const SYST_CVR: usize = 0xE000_E018;
+        // SAFETY: Configure SysTick as an interrupt-free, core-clock, 24-bit
+        // free-running down counter.
         unsafe {
-            write_volatile(DEMCR as *mut u32, read_volatile(DEMCR as *const u32) | (1 << 24));
-            write_volatile(DWT_CYCCNT as *mut u32, 0);
-            write_volatile(DWT_CTRL as *mut u32, read_volatile(DWT_CTRL as *const u32) | 1);
+            write_volatile(SYST_RVR as *mut u32, 0x00ff_ffff);
+            write_volatile(SYST_CVR as *mut u32, 0);
+            write_volatile(SYST_CSR as *mut u32, (1 << 2) | 1);
         }
-        Self { last: 0, total: 0 }
+        Self {
+            cycles_per_ms: u64::from(core_hz).max(1_000) / 1_000,
+            last: 0,
+            total: 0,
+        }
     }
 
     fn now(&mut self) -> Instant {
-        // SAFETY: DWT_CYCCNT is an aligned read-only use of the cycle counter.
-        let current = unsafe { read_volatile(0xE000_1004 as *const u32) };
-        self.total = self.total.wrapping_add(current.wrapping_sub(self.last) as u64);
+        // SAFETY: SysTick CVR is an aligned read-only counter register.
+        let current = unsafe { read_volatile(0xE000_E018 as *const u32) };
+        let elapsed = self.last.wrapping_sub(current) & 0x00ff_ffff;
+        self.total = self.total.wrapping_add(u64::from(elapsed));
         self.last = current;
-        Instant::from_millis((self.total / (CORE_HZ / 1_000)) as i64)
+        Instant::from_millis((self.total / self.cycles_per_ms) as i64)
     }
 }
 
@@ -58,18 +63,41 @@ fn main() -> ! {
         Ok(device) => device,
         Err(error) => {
             rprintln!("ERROR: ENET init={}", error);
-            loop { cortex_m::asm::nop(); }
+            loop {
+                cortex_m::asm::nop();
+            }
         }
     };
-    let status = device.status().unwrap_or_default();
+    let reported_core_hz = rt1052_bringup::enet_device::cpu_hz();
+    // A RAM-only image starts from the Boot ROM clock state. The SDK cannot
+    // always reconstruct that tree and reports zero; OSC24M is the safe root.
+    let core_hz = if reported_core_hz >= 1_000_000 {
+        reported_core_hz
+    } else {
+        24_000_000
+    };
+    let mut clock = CycleClock::new(core_hz);
+    let link_deadline = clock.now() + smoltcp::time::Duration::from_secs(5);
+    let status = loop {
+        let status = device.status().unwrap_or_default();
+        if status.link_up != 0 || clock.now() >= link_deadline {
+            break status;
+        }
+    };
     rprintln!(
-        "PHY {:04x}:{:04x} link={} {}M {} duplex",
-        status.phy_id1, status.phy_id2, status.link_up,
+        "PHY {:04x}:{:04x} link={} {}M {} duplex core={}Hz",
+        status.phy_id1,
+        status.phy_id2,
+        status.link_up,
         if status.speed_100m != 0 { 100 } else { 10 },
-        if status.full_duplex != 0 { "full" } else { "half" }
+        if status.full_duplex != 0 {
+            "full"
+        } else {
+            "half"
+        },
+        core_hz
     );
 
-    let mut clock = CycleClock::new();
     let mac = EthernetAddress([0x02, 0x10, 0x52, 0x00, 0x00, 0x01]);
     let mut config = Config::new(mac.into());
     config.random_seed = 0x1052_0001;
@@ -91,7 +119,10 @@ fn main() -> ! {
     let mut datagram = [0u8; control_protocol::HEADER_LEN + control_protocol::MAX_PAYLOAD_LEN];
     let mut ack = [0u8; 16];
 
-    rprintln!("DHCP: discovering; UDP {} will activate after lease", UDP_PORT);
+    rprintln!(
+        "DHCP: discovering; UDP {} will activate after lease",
+        UDP_PORT
+    );
     loop {
         let _ = iface.poll(clock.now(), &mut device, &mut sockets);
 
@@ -107,7 +138,12 @@ fn main() -> ! {
                 } else {
                     iface.routes_mut().remove_default_ipv4_route();
                 }
-                rprintln!("READY: DHCP IP={} gateway={:?} UDP {}", config.address, config.router, UDP_PORT);
+                rprintln!(
+                    "READY: DHCP IP={} gateway={:?} UDP {}",
+                    config.address,
+                    config.router,
+                    UDP_PORT
+                );
             }
             Some(dhcpv4::Event::Deconfigured) => {
                 iface.update_ip_addrs(|addresses| addresses.clear());
@@ -124,7 +160,9 @@ fn main() -> ! {
                     Ok(frame) => {
                         rprintln!("RTCP seq={} command={:?}", frame.sequence, frame.command);
                         let _ = queue.push(frame);
-                        if let Ok(ack_len) = control_protocol::encode_ack(&mut ack, frame.sequence, datagram[5], 0) {
+                        if let Ok(ack_len) =
+                            control_protocol::encode_ack(&mut ack, frame.sequence, datagram[5], 0)
+                        {
                             if socket.can_send() {
                                 let _ = socket.send_slice(&ack[..ack_len], remote.endpoint);
                             }
@@ -137,7 +175,12 @@ fn main() -> ! {
         // Probe executor: dequeue asynchronously. The integrated bridge will map
         // these commands to MacroEngine outside all USB and ENET IRQ paths.
         if let Some(frame) = queue.pop() {
-            rprintln!("EXEC seq={} command={:?} dropped={}", frame.sequence, frame.command, queue.dropped());
+            rprintln!(
+                "EXEC seq={} command={:?} dropped={}",
+                frame.sequence,
+                frame.command,
+                queue.dropped()
+            );
         }
     }
 }
