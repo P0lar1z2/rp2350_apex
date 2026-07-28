@@ -1,0 +1,8 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+runner = "probe-rs run --chip MIMXRT1052CVL5B --protocol swd --speed 50"
+rustflags = [
+    "-C", "link-arg=-Tlink.x",
+]

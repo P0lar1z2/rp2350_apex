@@ -122,3 +122,7 @@ reference/Pico-PIO-USB/
 # Python monitor/tool caches.
 __pycache__/
 *.py[cod]
+
+# Local vendor documentation and tool bundles; not part of this firmware.
+/野火【i.MX RT1052开发板】光盘资料/
+/.vendor/
