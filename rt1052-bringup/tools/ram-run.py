@@ -233,12 +233,14 @@ def main() -> int:
             gpr16 = struct.unpack("<I", rsp.read(0x400A_C040, 4))[0]
             gpr17 = struct.unpack("<I", rsp.read(0x400A_C044, 4))[0]
             dma = rsp.read(0x2020_0000, 32)
+            enet_tx_bd = rsp.read(0x2020_0040, 24)
             print(
                 f"state: pc=0x{rsp.get_register(GDB_REG_PC):08x} "
                 f"sp=0x{rsp.get_register(GDB_REG_SP):08x} "
                 f"xpsr=0x{rsp.get_register(GDB_REG_XPSR):08x} "
                 f"gpr14=0x{gpr14:08x} gpr16=0x{gpr16:08x} "
-                f"gpr17=0x{gpr17:08x} dma={dma.hex()}"
+                f"gpr17=0x{gpr17:08x} dma={dma.hex()} "
+                f"enet_tx_bd={enet_tx_bd.hex()}"
             )
             success = True
     finally:

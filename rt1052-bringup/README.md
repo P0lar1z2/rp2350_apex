@@ -71,3 +71,7 @@ LAN8720A. ENET DMA initialization and the 5 RX / 3 TX descriptor layout have
 been verified in RAM. The control plane uses a small allocation-free `RTCP` v1
 datagram format and a bounded queue: network congestion may drop a command or
 ACK, but it never blocks the USB data path.
+
+`enet_control` obtains its IPv4 configuration through DHCP and binds UDP port
+1052 only after a lease is configured. Its locally administered MAC address is
+`02:10:52:00:00:01`.

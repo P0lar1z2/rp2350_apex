@@ -66,6 +66,7 @@ fn main() -> ! {
                 "RX #{} len={} dst={:02x?} src={:02x?} type={:02x}{:02x}",
                 received, length, &frame[..6], &frame[6..12], frame[12], frame[13]
             );
+            rprintln!("RX bytes={:02x?}", &frame[..core::cmp::min(length as usize, 42)]);
         } else if length < 0 {
             rprintln!("RX error={}", length);
         }

@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "fsl_enet.h"
+#include "fsl_cache.h"
 
 #define RX_BD_COUNT 5U
 #define TX_BD_COUNT 3U
@@ -52,9 +53,29 @@ static bool init_board_phy(void) {
     *reg32(0x401F81B8U) = 0U;
     *reg32(0x401F8430U) = 2U;
     *reg32(0x401F83A8U) = 0xB0E9U;
-    *reg32(0x401F81A4U) = 6U;
+    /* ALT6 + SION: drive 50 MHz to the PHY and feed the same clock into ENET. */
+    *reg32(0x401F81A4U) = 6U | 0x10U;
     *reg32(0x401F842CU) = 1U;
     *reg32(0x401F8394U) = 0x31U;
+    /* RMII RXD0, RXD1, CRS_DV, TXD0, TXD1, TX_EN and RX_ER. */
+    *reg32(0x401F818CU) = 3U;
+    *reg32(0x401F8434U) = 1U;
+    *reg32(0x401F837CU) = 0xB0E9U;
+    *reg32(0x401F8190U) = 3U;
+    *reg32(0x401F8438U) = 1U;
+    *reg32(0x401F8380U) = 0xB0E9U;
+    *reg32(0x401F8194U) = 3U;
+    *reg32(0x401F843CU) = 1U;
+    *reg32(0x401F8384U) = 0xB0E9U;
+    *reg32(0x401F8198U) = 3U;
+    *reg32(0x401F8388U) = 0xB0E9U;
+    *reg32(0x401F819CU) = 3U;
+    *reg32(0x401F838CU) = 0xB0E9U;
+    *reg32(0x401F81A0U) = 3U;
+    *reg32(0x401F8390U) = 0xB0E9U;
+    *reg32(0x401F81A8U) = 3U;
+    *reg32(0x401F8440U) = 1U;
+    *reg32(0x401F8398U) = 0xB0E9U;
     *reg32(0x400AC004U) |= (1U << 17);
     if (!init_enet_pll()) {
         return false;
@@ -69,6 +90,8 @@ int32_t nxp_enet_init(void) {
     enet_config_t config;
     enet_buffer_config_t buffers;
     uint8_t mac[6] = {0x02, 0x10, 0x52, 0x00, 0x00, 0x01};
+    /* Buffer descriptors are shared with DMA and must never remain in D-cache. */
+    L1CACHE_DisableDCache();
     if (!init_board_phy()) {
         return -1;
     }
@@ -81,6 +104,8 @@ int32_t nxp_enet_init(void) {
     buffers.txBdStartAddrAlign = s_tx_bd;
     buffers.rxBufferAlign = &s_rx_buffers[0][0];
     buffers.txBufferAlign = &s_tx_buffers[0][0];
+    buffers.rxMaintainEnable = false;
+    buffers.txMaintainEnable = false;
     buffers.txFrameInfo = s_tx_info;
 
     ENET_GetDefaultConfig(&config);
