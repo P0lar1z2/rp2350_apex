@@ -3,6 +3,8 @@
 #[path = "../../src/usb_host/hid_report.rs"]
 pub mod hid_report;
 
+pub mod control_protocol;
+
 #[cfg(feature = "nxp-device")]
 pub mod usb_host {
     pub use crate::hid_report::*;

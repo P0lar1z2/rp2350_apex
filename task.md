@@ -58,8 +58,9 @@
 
 - [x] 通过 MDIO 探针确认板载 LAN8720A 的 PHY ID、地址和链路状态。
 - [ ] 接入 ENET DMA 和网络栈。
+- [ ] 接入 UDP `RTCP` v1 异步控制协议：网络收包只入有界队列，USB 路径不等待网络。
 - [ ] USB Host 中断优先级高于 USB Device，高于 ENET。
-- [ ] 网络协议只发送控制事件，不进入 USB 中断路径。
+- [ ] 网络协议只发送控制事件，不进入 USB 中断路径；异步 ACK 在拥塞时允许丢弃。
 - [ ] 在满载网络流量下复测 8K USB，不允许出现持续丢报告或降频。
 
 ## 首轮验收
@@ -92,4 +93,6 @@
 - 当前阻塞：无。
 - Ethernet 板级参数：Pro 底板使用 LAN8720 系列 PHY，MDIO 地址 0；GPIO1_IO09 为复位，GPIO1_IO10 需在复位前拉高；RT1052 从 GPIO_B1_10 输出 50 MHz RMII REF_CLK。
 - Ethernet 实测：ENET PLL 锁定；MDIO 读取 `ID1=0x0007`、`ID2=0xC0F1`，确认 LAN8720A；探针运行时 BMSR Link 位为 0（PHY 在线，未建立网线链路）。
-- 下一步：接入 ENET DMA 并收发原始以太网帧；连接下游键盘后补做宏触发实机验收。
+- ENET DMA 实测：NXP ENET 初始化成功，非缓存 OCRAM 中的 5 RX / 3 TX 描述符环已建立；无网线时状态轮询稳定为 Link Down，收包计数为 0。
+- 异步控制协议：已定义无分配 `RTCP` v1 报文、启停/切层/触发/释放/全释放命令、异步 ACK 编码和满载即丢新命令的有界队列；待接 UDP/IP。
+- 下一步：接入轻量 UDP/IP 并在网线 Link Up 后验收收发；连接下游键盘后补做宏触发实机验收。

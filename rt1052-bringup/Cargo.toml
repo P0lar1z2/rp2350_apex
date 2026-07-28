@@ -7,6 +7,7 @@ publish = false
 [features]
 default = []
 nxp-host = []
+nxp-enet = []
 nxp-device = ["dep:imxrt-ral", "dep:imxrt-usbd", "dep:usb-device"]
 
 [dependencies]
@@ -32,6 +33,11 @@ required-features = ["nxp-host"]
 [[bin]]
 name = "enet_probe"
 path = "src/bin/enet_probe.rs"
+
+[[bin]]
+name = "enet_dma_probe"
+path = "src/bin/enet_dma_probe.rs"
+required-features = ["nxp-enet"]
 
 [[bin]]
 name = "device_hid"

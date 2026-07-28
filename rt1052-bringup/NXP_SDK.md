@@ -17,11 +17,12 @@ These revisions come from the official manifest branch
 `release/26.06.00-lts`. The USB stack reports version `2.12.2` from
 `middleware/usb/include/usb.h`.
 
-Only these NXP sources are compiled for the first probe:
+Only these NXP sources are compiled for the current probes:
 
 - common and RT1052 clock drivers;
 - USB PHY;
 - Host core, enumeration framework, EHCI;
 - Hub and HID class drivers.
+- ENET MAC/DMA driver for the independent Ethernet probe.
 
 All other middleware and RTOS code remains outside the firmware build.

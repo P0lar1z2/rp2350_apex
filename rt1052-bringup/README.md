@@ -12,12 +12,16 @@ programmed.
 - `host_enumerate`: NXP USB Host 2.12.2 bare-metal EHCI + Hub probe for OTG2.
   It reports HID VID/PID, speed, hub path, Interrupt IN address,
   `wMaxPacketSize`, and `bInterval` over RTT.
+- `enet_probe`: reads the Pro board's LAN8720A identity and link state over MDIO.
+- `enet_dma_probe`: initializes five RX and three TX descriptors in non-cacheable
+  OCRAM, then polls raw frames without an RTOS.
 
 ## Build
 
 ```sh
 cargo build --bin host_probe
 cargo build --features nxp-host --bin host_enumerate
+cargo build --features nxp-enet --bin enet_dma_probe
 ```
 
 The NXP build needs the locally ignored `.vendor/` tree documented in
@@ -61,3 +65,9 @@ The connected `17ef:62c2` composite receiver enumerates its mouse as interface
 `0x82`, with an 8-byte maximum packet and `bInterval=1`. It is a Full-Speed
 source, so this path has a 1 ms / 1 kHz ceiling; it must not be advertised as
 8 kHz. Continuous receive has been verified with 7-byte raw mouse reports.
+
+The Pro board PHY responds at MDIO address 0 with ID `0007:c0f1`, identifying a
+LAN8720A. ENET DMA initialization and the 5 RX / 3 TX descriptor layout have
+been verified in RAM. The control plane uses a small allocation-free `RTCP` v1
+datagram format and a bounded queue: network congestion may drop a command or
+ACK, but it never blocks the USB data path.
