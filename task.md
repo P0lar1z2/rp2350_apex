@@ -31,7 +31,7 @@
 - [x] 枚举 Hub 端口 3 下的鼠标（17ef:62c2，地址 2）。
 - [x] 输出鼠标 speed、VID、PID、端点地址、`bInterval`、`wMaxPacketSize`。
 - [x] 连续读取并输出 HID Interrupt IN 报告（实测收到 7 字节原始鼠标报告）。
-- [ ] 读取并输出 HID Report Descriptor。
+- [x] 读取并输出 HID Report Descriptor（实测 185 字节）。
 
 ### 2. 8K Host 接收
 
@@ -43,10 +43,13 @@
 
 ### 3. USB Device 与桥接
 
-- [ ] OTG1 以 High-Speed Device 枚举到上位机。
+- [x] OTG1 以 High-Speed Device 枚举到上位机（实测 480 Mbit/s、EP0 64 字节）。
+- [x] 固定键盘、鼠标、Consumer 三接口 HID 枚举，Interrupt IN 均为 High-Speed `bInterval=1`。
+- [x] 完成首条固定 HID 鼠标桥接：OTG2 原始报告经 Rust 解码后由 OTG1 转发。
 - [ ] 根据来源设备描述符创建 HID 接口和 Interrupt IN 端点。
 - [ ] 8K 来源设备保持 `bInterval=1`，不得在桥接层降为 1K。
-- [ ] 迁移现有 HID 描述符解析、动态克隆和宏引擎。
+- [ ] 完成动态 HID 克隆和宏引擎迁移。
+- [x] 复用现有无分配 Rust HID Report Descriptor 解析器，并在 RT1052 实机解码鼠标报告。
 - [ ] 处理热插拔、STALL、超时和设备重新枚举。
 
 ### 4. Ethernet 控制
@@ -67,9 +70,12 @@
 ## 当前工作
 
 - 分支：`feature/rt1052-nxp-usb-host`
-- 已完成：NXP USB Host 2.12.2 构建、裸机 OSA、Rust FFI、OTG2 枚举探针。
+- 已完成：NXP USB Host 2.12.2 构建、裸机 OSA、Rust FFI、OTG2 枚举探针、Report Descriptor 获取及 Rust 报告解析。
 - 已验证：NXP 默认 OCRAM `0x20200000` 的 CPU 写回与 DAP 回读通过；OTG2 EHCI、Hub、HID 枚举通过。
 - 实测鼠标：接口 1、协议 2（Mouse）、Full-Speed，Interrupt IN `0x82`，`wMaxPacketSize=8`，`bInterval=1`，因此当前链路最多 1 kHz，不是 8 kHz。
-- 实测接收：15 秒窗口内移动鼠标得到 10 个成功的 7 字节原始报告；NXP 回调重挂、DTCM 有界队列和 Rust 消费链路通过。
+- 实测接收：30 秒窗口内连续收到超过 1,400 个成功的 7 字节鼠标报告；NXP 回调采用任务循环延迟重挂，避免与控制传输争抢 transfer 对象；DTCM 有界队列和 Rust 消费链路通过。
+- 实测解析：读取 185 字节 HID Report Descriptor；复用 RP2350 的无分配 Rust 解析器，正确解码 Report ID 2、8 个按键、12 位有符号 X/Y、滚轮和横向滚轮。
+- 实测 Device：OTG1 使用 `imxrt-usbd`/`usb-device` 枚举为 480 Mbit/s High-Speed Device；EP0 为 64 字节，三个 HID 接口均被 Linux `usbhid` 绑定。
+- 实测桥接：OTG2 NXP Host 与 OTG1 Rust Device 同时运行；连续转发超过 1,664 个鼠标报告，按键、X/Y、滚轮均通过，观测窗口内 `dropped=0`。
 - 当前阻塞：无。
-- 下一步：读取 HID Report Descriptor，接入现有 Rust 描述符解析与动态克隆逻辑。
+- 下一步：用来源设备的身份、接口和 Report Descriptor 替换固定 HID 配置，完成动态克隆。

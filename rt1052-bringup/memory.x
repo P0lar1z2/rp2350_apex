@@ -12,6 +12,16 @@ MEMORY
 
 SECTIONS
 {
+  /* imxrt-usbd's endpoint state contains constructor state and must be
+   * initialized by the RAM loader, unlike the NXP Host's NOLOAD DMA pool. */
+  .usb_device : ALIGN(4096)
+  {
+    __usb_device_start = .;
+    KEEP(*(.usb_device .usb_device.*));
+    . = ALIGN(32);
+    __usb_device_end = .;
+  } > OCRAM
+
   .usb_dma (NOLOAD) : ALIGN(32)
   {
     __usb_dma_start = .;

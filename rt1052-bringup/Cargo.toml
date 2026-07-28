@@ -7,6 +7,7 @@ publish = false
 [features]
 default = []
 nxp-host = []
+nxp-device = ["dep:imxrt-ral", "dep:imxrt-usbd", "dep:usb-device"]
 
 [dependencies]
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
@@ -14,11 +15,24 @@ cortex-m-rt = "0.7"
 panic-halt = "1"
 panic-rtt-target = "0.2.0"
 rtt-target = "0.6.2"
+imxrt-ral = { version = "0.6.2", features = ["imxrt1052"], optional = true }
+imxrt-usbd = { version = "0.4.2", optional = true }
+usb-device = { version = "0.3.2", features = ["control-buffer-256"], optional = true }
 
 [[bin]]
 name = "host_enumerate"
 path = "src/bin/host_enumerate.rs"
 required-features = ["nxp-host"]
+
+[[bin]]
+name = "device_hid"
+path = "src/bin/device_hid.rs"
+required-features = ["nxp-host", "nxp-device"]
+
+[[bin]]
+name = "hid_bridge"
+path = "src/bin/hid_bridge.rs"
+required-features = ["nxp-host", "nxp-device"]
 
 [profile.dev]
 opt-level = 2

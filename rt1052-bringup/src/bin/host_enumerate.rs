@@ -5,7 +5,8 @@ use core::ptr::{read_volatile, write_volatile};
 
 use cortex_m_rt::entry;
 use panic_rtt_target as _;
-use rtt_target::{rprintln, rtt_init_print};
+use rt1052_bringup::hid_report::{DecodedReport, ReportDecoder, parse_report_descriptor};
+use rtt_target::{ChannelMode::NoBlockSkip, rprintln, rtt_init_print};
 
 const IOMUXC_GPR_GPR14: usize = 0x400A_C038;
 const IOMUXC_GPR_GPR16: usize = 0x400A_C040;
@@ -50,6 +51,7 @@ unsafe extern "C" {
     fn nxp_host_irq();
     fn nxp_host_pop_event(event: *mut HostEvent) -> i32;
     fn nxp_host_pop_report(report: *mut HostReport) -> i32;
+    fn nxp_host_copy_report_descriptor(buffer: *mut u8, capacity: u16) -> i32;
 }
 
 #[inline]
@@ -83,7 +85,7 @@ fn main() -> ! {
     rt1052_bringup::use_nxp_default_flexram();
     cortex_m::interrupt::disable();
     write32(SCB_VTOR, 0);
-    rtt_init_print!();
+    rtt_init_print!(NoBlockSkip, 4096);
 
     let gpr14 = read32(IOMUXC_GPR_GPR14);
     let gpr16 = read32(IOMUXC_GPR_GPR16);
@@ -119,6 +121,8 @@ fn main() -> ! {
     write32(NVIC_ISER3, 1 << 16);
     unsafe { cortex_m::interrupt::enable() };
     rprintln!("OTG2 EHCI running; waiting for FE1.1S hub and HID mouse");
+
+    let mut decoder = ReportDecoder::empty();
 
     loop {
         // SAFETY: Bare-metal task function is called from this one main loop.
@@ -170,6 +174,31 @@ fn main() -> ! {
                 3 => rprintln!("enumeration failed, status={}", event.status),
                 4 if event.status == 0 => rprintln!("HID Interrupt IN receiver ready"),
                 4 => rprintln!("HID receiver setup failed, status={}", event.status),
+                5 if event.status == 0 => {
+                    let mut descriptor = [0u8; 512];
+                    // SAFETY: The destination has the advertised 512-byte capacity.
+                    let length =
+                        unsafe { nxp_host_copy_report_descriptor(descriptor.as_mut_ptr(), 512) };
+                    if length > 0 {
+                        let length = usize::try_from(length).unwrap_or(0).min(descriptor.len());
+                        rprintln!("HID Report Descriptor: {} bytes", length);
+                        for (offset, chunk) in descriptor[..length].chunks(16).enumerate() {
+                            rprintln!("  {:03x}: {:02x?}", offset * 16, chunk);
+                        }
+                        decoder = parse_report_descriptor(&descriptor[..length]);
+                        if decoder.is_empty() {
+                            rprintln!("Rust HID parser found no supported input layout");
+                        } else {
+                            rprintln!("Rust HID parser ready");
+                        }
+                    } else {
+                        rprintln!("HID Report Descriptor callback returned no data");
+                    }
+                }
+                5 => rprintln!(
+                    "HID Report Descriptor request failed, status={}",
+                    event.status
+                ),
                 _ => {}
             }
         }
@@ -192,6 +221,25 @@ fn main() -> ! {
                     length,
                     &report.data[..length]
                 );
+                match decoder.decode(&report.data[..length]) {
+                    Some(DecodedReport::Mouse(mouse)) => rprintln!(
+                        "mouse buttons={:#04x} x={} y={} wheel={} pan={}",
+                        mouse.buttons,
+                        mouse.x,
+                        mouse.y,
+                        mouse.wheel,
+                        mouse.pan
+                    ),
+                    Some(DecodedReport::Keyboard(keyboard)) => rprintln!(
+                        "keyboard modifiers={:#04x} keys={:02x?}",
+                        keyboard.modifiers,
+                        keyboard.keys
+                    ),
+                    Some(DecodedReport::Consumer(usage)) => {
+                        rprintln!("consumer usage={:#06x}", usage)
+                    }
+                    None => rprintln!("report did not match a supported HID layout"),
+                }
             }
         }
     }

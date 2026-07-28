@@ -10,6 +10,7 @@ enum
     NXP_HOST_EVENT_DETACHED,
     NXP_HOST_EVENT_ENUMERATION_FAILED,
     NXP_HOST_EVENT_HID_READY,
+    NXP_HOST_EVENT_REPORT_DESCRIPTOR,
 };
 
 typedef struct
@@ -43,5 +44,7 @@ void nxp_host_task(void);
 void nxp_host_irq(void);
 int32_t nxp_host_pop_event(nxp_host_event_t *event);
 int32_t nxp_host_pop_report(nxp_host_report_t *report);
+int32_t nxp_host_copy_report_descriptor(uint8_t *buffer, uint16_t capacity);
+int32_t nxp_device_init_clocks(void);
 
 #endif
