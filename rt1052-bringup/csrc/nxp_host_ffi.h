@@ -27,7 +27,9 @@ typedef struct
     uint16_t pid;
     uint16_t maxPacketSize;
     uint8_t interfaceNumber;
+    uint8_t interfaceSubclass;
     uint8_t interfaceProtocol;
+    uint8_t reserved;
 } nxp_host_event_t;
 
 typedef struct
@@ -35,9 +37,12 @@ typedef struct
     uint32_t sequence;
     uint8_t length;
     uint8_t status;
-    uint8_t data[16];
+    uint8_t data[64];
     uint16_t reserved;
 } nxp_host_report_t;
+
+_Static_assert(sizeof(nxp_host_event_t) == 18U, "nxp_host_event_t ABI changed");
+_Static_assert(sizeof(nxp_host_report_t) == 72U, "nxp_host_report_t ABI changed");
 
 int32_t nxp_host_init(void);
 void nxp_host_task(void);

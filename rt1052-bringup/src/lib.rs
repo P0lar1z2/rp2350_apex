@@ -12,6 +12,9 @@ pub mod usb_host {
 #[path = "../../src/hid_device.rs"]
 pub mod hid_device;
 
+#[cfg(feature = "nxp-device")]
+pub mod runtime_hid;
+
 /// Marks firmware that relies on the RT1052 reset-time default RAM partition.
 ///
 /// Keeping this call in binaries also retains this crate's native-link

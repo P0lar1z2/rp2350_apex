@@ -46,8 +46,8 @@
 - [x] OTG1 以 High-Speed Device 枚举到上位机（实测 480 Mbit/s、EP0 64 字节）。
 - [x] 固定键盘、鼠标、Consumer 三接口 HID 枚举，Interrupt IN 均为 High-Speed `bInterval=1`。
 - [x] 完成首条固定 HID 鼠标桥接：OTG2 原始报告经 Rust 解码后由 OTG1 转发。
-- [ ] 根据来源设备描述符创建 HID 接口和 Interrupt IN 端点。
-- [ ] 8K 来源设备保持 `bInterval=1`，不得在桥接层降为 1K。
+- [x] 根据来源设备描述符创建单个 HID 接口和 Interrupt IN 端点。
+- [x] 按来源速度换算上游 High-Speed `bInterval`：8K 来源保持 1，当前 Full-Speed 1 ms 来源转换为 4。
 - [ ] 完成动态 HID 克隆和宏引擎迁移。
 - [x] 复用现有无分配 Rust HID Report Descriptor 解析器，并在 RT1052 实机解码鼠标报告。
 - [ ] 处理热插拔、STALL、超时和设备重新枚举。
@@ -77,5 +77,9 @@
 - 实测解析：读取 185 字节 HID Report Descriptor；复用 RP2350 的无分配 Rust 解析器，正确解码 Report ID 2、8 个按键、12 位有符号 X/Y、滚轮和横向滚轮。
 - 实测 Device：OTG1 使用 `imxrt-usbd`/`usb-device` 枚举为 480 Mbit/s High-Speed Device；EP0 为 64 字节，三个 HID 接口均被 Linux `usbhid` 绑定。
 - 实测桥接：OTG2 NXP Host 与 OTG1 Rust Device 同时运行；连续转发超过 1,664 个鼠标报告，按键、X/Y、滚轮均通过，观测窗口内 `dropped=0`。
+- 实测动态克隆：从来源读取 VID/PID、HID subclass/protocol、185 字节 Report Descriptor、端点包长和轮询间隔，再创建 OTG1 单接口 HID；Linux 实测识别为 `17ef:62c2`、480 Mbit/s、EP0 64、Interrupt IN 8 字节、`bInterval=4`。
+- 实测原始转发：动态克隆路径连续转发超过 1,536 个原始报告，按键和 X/Y 正确，观测窗口内 `dropped=0`。
+- Host→Rust 报告队列和动态 Device 原始转发容量为 64 字节；更大端点会明确拒绝，不允许 DMA 缓冲越界或静默截断。
+- 当前动态克隆范围：只克隆选中的鼠标 HID 接口，不克隆接收器的完整复合配置、原始字符串或其他接口；热插拔后仍需重新枚举 OTG1。
 - 当前阻塞：无。
-- 下一步：用来源设备的身份、接口和 Report Descriptor 替换固定 HID 配置，完成动态克隆。
+- 下一步：处理来源设备热插拔和 OTG1 自动重枚举，再迁移宏引擎；之后接入 Ethernet 控制面。

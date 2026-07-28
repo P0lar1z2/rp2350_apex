@@ -8,8 +8,8 @@ use imxrt_ral as ral;
 use imxrt_usbd::{BusAdapter, EndpointMemory, EndpointState, Instances};
 use panic_rtt_target as _;
 use rt1052_bringup::{
-    hid_device::KeyboardMouseHid,
-    hid_report::{DecodedReport, ReportDecoder, parse_report_descriptor},
+    hid_report::{DecodedReport, parse_report_descriptor},
+    runtime_hid::{RuntimeHid, high_speed_interval},
 };
 use rtt_target::{ChannelMode::NoBlockSkip, rprintln, rtt_init_print};
 use usb_device::{
@@ -45,7 +45,9 @@ struct HostEvent {
     pid: u16,
     max_packet_size: u16,
     interface_number: u8,
+    interface_subclass: u8,
     interface_protocol: u8,
+    reserved: u8,
 }
 
 impl HostEvent {
@@ -63,7 +65,9 @@ impl HostEvent {
             pid: 0,
             max_packet_size: 0,
             interface_number: 0,
+            interface_subclass: 0,
             interface_protocol: 0,
+            reserved: 0,
         }
     }
 }
@@ -74,9 +78,12 @@ struct HostReport {
     sequence: u32,
     length: u8,
     status: u8,
-    data: [u8; 16],
+    data: [u8; 64],
     reserved: u16,
 }
+
+const _: () = assert!(core::mem::size_of::<HostEvent>() == 18);
+const _: () = assert!(core::mem::size_of::<HostReport>() == 72);
 
 impl HostReport {
     const fn empty() -> Self {
@@ -84,7 +91,7 @@ impl HostReport {
             sequence: 0,
             length: 0,
             status: 0,
-            data: [0; 16],
+            data: [0; 64],
             reserved: 0,
         }
     }
@@ -132,6 +139,81 @@ fn main() -> ! {
         }
     }
 
+    write32(NVIC_ICPR3, 1 << 16);
+    // SAFETY: USB_OTG2 is IRQ 112, configured at priority 3 of 16.
+    unsafe { write_volatile(NVIC_IPR_USB_OTG2 as *mut u8, 3 << 4) };
+    write32(NVIC_ISER3, 1 << 16);
+    // SAFETY: The USB2 vector and peripheral state are initialized above.
+    unsafe { cortex_m::interrupt::enable() };
+
+    rprintln!("waiting for OTG2 source profile before attaching OTG1");
+    let mut source = HostEvent::empty();
+    let mut have_source = false;
+    let mut report_descriptor = [0u8; 512];
+    let report_descriptor_len = 'profile: loop {
+        // SAFETY: Called only from this main loop; USB2 IRQ handles controller events.
+        unsafe { nxp_host_task() };
+        let mut event = HostEvent::empty();
+        // SAFETY: `event` is writable storage matching the C ABI.
+        while unsafe { nxp_host_pop_event(&mut event) } != 0 {
+            match event.kind {
+                1 => {
+                    source = event;
+                    have_source = true;
+                    rprintln!(
+                        "source {:04x}:{:04x} speed={} subclass={} protocol={} packet={} interval={}",
+                        source.vid,
+                        source.pid,
+                        source.speed,
+                        source.interface_subclass,
+                        source.interface_protocol,
+                        source.max_packet_size,
+                        source.interval
+                    );
+                }
+                2 => {
+                    have_source = false;
+                    rprintln!("source detached while reading profile");
+                }
+                3 => rprintln!("OTG2 enumeration failed status={}", event.status),
+                4 if event.status == 0 => rprintln!("OTG2 Interrupt IN ready"),
+                4 => rprintln!("OTG2 receiver failed status={}", event.status),
+                5 if event.status == 0 && have_source => {
+                    // SAFETY: Destination capacity matches the FFI argument.
+                    let length = unsafe {
+                        nxp_host_copy_report_descriptor(report_descriptor.as_mut_ptr(), 512)
+                    };
+                    if length > 0 {
+                        let length = usize::try_from(length)
+                            .unwrap_or(0)
+                            .min(report_descriptor.len());
+                        break 'profile length;
+                    }
+                }
+                5 => rprintln!("OTG2 descriptor failed status={}", event.status),
+                _ => {}
+            }
+        }
+    };
+
+    let upstream_interval = high_speed_interval(source.speed, source.interval);
+    rprintln!(
+        "profile ready: descriptor={} bytes, HS interval={} (source interval={})",
+        report_descriptor_len,
+        upstream_interval,
+        source.interval
+    );
+    if source.max_packet_size > 64 {
+        rprintln!(
+            "unsupported source packet size {}; bridge capacity is 64 bytes",
+            source.max_packet_size
+        );
+        loop {
+            // Keep servicing OTG2 so detach and controller state remain clean.
+            unsafe { nxp_host_task() };
+        }
+    }
+
     // SAFETY: USB1 is exclusively owned by the Rust Device stack.
     let device_clock_status = unsafe { nxp_device_init_clocks() };
     rprintln!("OTG1 Device clock status={}", device_clock_status);
@@ -148,12 +230,19 @@ fn main() -> ! {
         usbphy: unsafe { ral::usbphy::USBPHY1::instance() },
     };
     let bus = UsbBusAllocator::new(BusAdapter::new(instances, &EP_MEMORY, &EP_STATE));
-    let mut hid = KeyboardMouseHid::new(&bus);
+    let mut hid = RuntimeHid::new(
+        &bus,
+        &report_descriptor[..report_descriptor_len],
+        source.max_packet_size.clamp(1, 64),
+        upstream_interval,
+        source.interface_subclass,
+        source.interface_protocol,
+    );
     let strings = [StringDescriptors::default()
         .manufacturer("xense")
-        .product("RT1052 USB HID Bridge")
-        .serial_number("RAM-BRIDGE")];
-    let mut device = UsbDeviceBuilder::new(&bus, UsbVidPid(0x1209, 0x1052))
+        .product("RT1052 Dynamic HID Clone")
+        .serial_number("RAM-CLONE")];
+    let mut device = UsbDeviceBuilder::new(&bus, UsbVidPid(source.vid, source.pid))
         .strings(&strings)
         .expect("valid static USB strings")
         .device_class(0)
@@ -161,15 +250,8 @@ fn main() -> ! {
         .expect("64-byte EP0 is valid for high-speed USB")
         .build();
 
-    write32(NVIC_ICPR3, 1 << 16);
-    // SAFETY: USB_OTG2 is IRQ 112; priority 3 of 16 leaves room for later USB1 priority 4.
-    unsafe { write_volatile(NVIC_IPR_USB_OTG2 as *mut u8, 3 << 4) };
-    write32(NVIC_ISER3, 1 << 16);
-    // SAFETY: The USB2 vector and peripheral state are initialized above.
-    unsafe { cortex_m::interrupt::enable() };
-
-    rprintln!("bridge running: OTG2 mouse -> Rust decoder -> OTG1 HS HID");
-    let mut decoder = ReportDecoder::empty();
+    rprintln!("dynamic clone running: OTG2 raw HID -> OTG1 cloned HID");
+    let decoder = parse_report_descriptor(&report_descriptor[..report_descriptor_len]);
     let mut device_configured = false;
     let mut forwarded = 0u32;
     let mut dropped = 0u32;
@@ -201,26 +283,13 @@ fn main() -> ! {
                     event.interval
                 ),
                 2 => {
-                    decoder = ReportDecoder::empty();
-                    rprintln!("OTG2 HID detached");
+                    rprintln!("OTG2 HID detached; reconnect requires OTG1 re-enumeration");
                 }
                 3 => rprintln!("OTG2 enumeration failed status={}", event.status),
                 4 if event.status == 0 => rprintln!("OTG2 Interrupt IN ready"),
                 4 => rprintln!("OTG2 receiver failed status={}", event.status),
                 5 if event.status == 0 => {
-                    let mut descriptor = [0u8; 512];
-                    // SAFETY: Destination capacity matches the FFI argument.
-                    let length =
-                        unsafe { nxp_host_copy_report_descriptor(descriptor.as_mut_ptr(), 512) };
-                    if length > 0 {
-                        let length = usize::try_from(length).unwrap_or(0).min(descriptor.len());
-                        decoder = parse_report_descriptor(&descriptor[..length]);
-                        rprintln!(
-                            "OTG2 descriptor={} bytes decoder_ready={}",
-                            length,
-                            !decoder.is_empty()
-                        );
-                    }
+                    rprintln!("OTG2 descriptor refreshed; active clone remains unchanged");
                 }
                 5 => rprintln!("OTG2 descriptor failed status={}", event.status),
                 _ => {}
@@ -230,30 +299,35 @@ fn main() -> ! {
         let mut report = HostReport::empty();
         // SAFETY: `report` is writable storage matching the C ABI.
         while unsafe { nxp_host_pop_report(&mut report) } != 0 {
-            let length = usize::from(report.length.min(16));
-            let Some(DecodedReport::Mouse(mouse)) = decoder.decode(&report.data[..length]) else {
-                continue;
-            };
+            let length = usize::from(report.length.min(64));
             if !device_configured {
                 dropped = dropped.wrapping_add(1);
                 continue;
             }
-            match hid.push_mouse_extended(mouse.buttons, mouse.x, mouse.y, mouse.wheel, mouse.pan) {
+            match hid.push_report(&report.data[..length]) {
                 Ok(_) => forwarded = forwarded.wrapping_add(1),
                 Err(UsbError::WouldBlock) => dropped = dropped.wrapping_add(1),
                 Err(_) => dropped = dropped.wrapping_add(1),
             }
             if forwarded <= 16 || forwarded & 127 == 0 {
-                rprintln!(
-                    "bridge #{} buttons={:#04x} x={} y={} wheel={} pan={} dropped={}",
-                    forwarded,
-                    mouse.buttons,
-                    mouse.x,
-                    mouse.y,
-                    mouse.wheel,
-                    mouse.pan,
-                    dropped
-                );
+                match decoder.decode(&report.data[..length]) {
+                    Some(DecodedReport::Mouse(mouse)) => rprintln!(
+                        "clone #{} buttons={:#04x} x={} y={} wheel={} pan={} dropped={}",
+                        forwarded,
+                        mouse.buttons,
+                        mouse.x,
+                        mouse.y,
+                        mouse.wheel,
+                        mouse.pan,
+                        dropped
+                    ),
+                    _ => rprintln!(
+                        "clone #{} raw_len={} dropped={}",
+                        forwarded,
+                        length,
+                        dropped
+                    ),
+                }
             }
         }
 

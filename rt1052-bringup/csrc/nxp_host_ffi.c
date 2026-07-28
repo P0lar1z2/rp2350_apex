@@ -10,7 +10,7 @@
 #define HOST_CONTROLLER_ID ((uint8_t)kUSB_ControllerEhci1)
 #define EVENT_QUEUE_CAPACITY (8U)
 #define REPORT_QUEUE_CAPACITY (32U)
-#define REPORT_DATA_CAPACITY (16U)
+#define REPORT_DATA_CAPACITY (64U)
 #define HID_RX_BUFFER_SIZE (64U)
 #define HID_REPORT_DESCRIPTOR_CAPACITY (512U)
 
@@ -117,7 +117,8 @@ static void StartHidReceive(void)
     nxp_host_event_t readyEvent = {0};
     usb_status_t receiveStatus  = kStatus_USB_Error;
 
-    if ((s_hidClass != NULL) && (s_hidPacketSize != 0U))
+    if ((s_hidClass != NULL) && (s_hidPacketSize != 0U) &&
+        (s_hidPacketSize <= HID_RX_BUFFER_SIZE))
     {
         receiveStatus =
             USB_HostHidRecv(s_hidClass, s_hidRxBuffer, s_hidPacketSize, HidReceiveCallback, NULL);
@@ -263,6 +264,7 @@ static usb_status_t HostEvent(usb_device_handle device,
                 event.vid        = (uint16_t)GetInfo(device, kUSB_HostGetDeviceVID);
                 event.pid        = (uint16_t)GetInfo(device, kUSB_HostGetDevicePID);
                 event.interfaceNumber   = interface->interfaceDesc->bInterfaceNumber;
+                event.interfaceSubclass = interface->interfaceDesc->bInterfaceSubClass;
                 event.interfaceProtocol = interface->interfaceDesc->bInterfaceProtocol;
 
                 for (endpointIndex = 0U; endpointIndex < interface->epCount; ++endpointIndex)
@@ -283,10 +285,6 @@ static usb_status_t HostEvent(usb_device_handle device,
                 s_hidPacketSize = event.maxPacketSize;
                 s_reportDescriptorLength = FindReportDescriptorLength(interface);
                 s_reportDescriptorActualLength = 0U;
-                if (s_hidPacketSize > HID_RX_BUFFER_SIZE)
-                {
-                    s_hidPacketSize = HID_RX_BUFFER_SIZE;
-                }
                 status = USB_HostHidInit(device, &s_hidClass);
                 if (status == kStatus_USB_Success)
                 {

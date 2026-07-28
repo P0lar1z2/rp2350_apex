@@ -32,7 +32,9 @@ struct HostEvent {
     pid: u16,
     max_packet_size: u16,
     interface_number: u8,
+    interface_subclass: u8,
     interface_protocol: u8,
+    reserved: u8,
 }
 
 #[repr(C)]
@@ -41,9 +43,12 @@ struct HostReport {
     sequence: u32,
     length: u8,
     status: u8,
-    data: [u8; 16],
+    data: [u8; 64],
     reserved: u16,
 }
+
+const _: () = assert!(core::mem::size_of::<HostEvent>() == 18);
+const _: () = assert!(core::mem::size_of::<HostReport>() == 72);
 
 unsafe extern "C" {
     fn nxp_host_init() -> i32;
@@ -141,20 +146,23 @@ fn main() -> ! {
             pid: 0,
             max_packet_size: 0,
             interface_number: 0,
+            interface_subclass: 0,
             interface_protocol: 0,
+            reserved: 0,
         };
         // SAFETY: `event` is valid writable storage matching the C ABI.
         while unsafe { nxp_host_pop_event(&mut event) } != 0 {
             match event.kind {
                 1 => {
                     rprintln!(
-                        "HID {:04x}:{:04x} addr={} via hub={} port={} interface={} protocol={}",
+                        "HID {:04x}:{:04x} addr={} via hub={} port={} interface={} subclass={} protocol={}",
                         event.vid,
                         event.pid,
                         event.address,
                         event.hub_address,
                         event.hub_port,
                         event.interface_number,
+                        event.interface_subclass,
                         event.interface_protocol
                     );
                     rprintln!(
@@ -207,12 +215,12 @@ fn main() -> ! {
             sequence: 0,
             length: 0,
             status: 0,
-            data: [0; 16],
+            data: [0; 64],
             reserved: 0,
         };
         // SAFETY: `report` is valid writable storage matching the C ABI.
         while unsafe { nxp_host_pop_report(&mut report) } != 0 {
-            let length = usize::from(report.length.min(16));
+            let length = usize::from(report.length.min(64));
             if report.sequence <= 16 || (report.sequence & 127) == 0 || report.status != 0 {
                 rprintln!(
                     "report #{} status={} len={} data={:02x?}",
