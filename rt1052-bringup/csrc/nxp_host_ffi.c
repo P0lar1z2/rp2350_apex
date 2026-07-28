@@ -196,17 +196,19 @@ static void HidReceiveCallback(void *param, uint8_t *data, uint32_t dataLen, usb
     {
         length = REPORT_DATA_CAPACITY;
     }
-    report.sequence = ++s_reportSequence;
-    report.length   = (uint8_t)length;
-    report.status   = (uint8_t)status;
-    report.interfaceNumber = slot->interfaceNumber;
-    report.interfaceIndex  = slot->interfaceIndex;
-    for (index = 0U; index < length; ++index)
+    if ((status == kStatus_USB_Success) && (length != 0U))
     {
-        report.data[index] = data[index];
+        report.sequence = ++s_reportSequence;
+        report.length   = (uint8_t)length;
+        report.status   = (uint8_t)status;
+        report.interfaceNumber = slot->interfaceNumber;
+        report.interfaceIndex  = slot->interfaceIndex;
+        for (index = 0U; index < length; ++index)
+        {
+            report.data[index] = data[index];
+        }
+        PushReport(&report);
     }
-    PushReport(&report);
-
 }
 
 static void HidInterfaceCallback(void *param, uint8_t *data, uint32_t dataLen, usb_status_t status)

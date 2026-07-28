@@ -51,7 +51,8 @@
 - [x] 完成来源复合 HID 的动态接口/描述符克隆。
 - [ ] 完成宏引擎实机触发验收（代码、共享配置和 20 项单元测试已迁移；待下游键盘操作）。
 - [x] 复用现有无分配 Rust HID Report Descriptor 解析器，并在 RT1052 实机解码鼠标报告。
-- [ ] 处理热插拔、STALL、超时和设备重新枚举。
+- [x] 相同来源 profile 热插拔时断开 OTG1，重新核验全部接口描述符后自动重新枚举。
+- [ ] 处理不同来源 profile 的运行期重建、STALL 和超时恢复。
 
 ### 4. Ethernet 控制
 
@@ -83,7 +84,9 @@
 - Host→Rust 报告队列和动态 Device 原始转发容量为 64 字节；更大端点会明确拒绝，不允许 DMA 缓冲越界或静默截断。
 - 实测复合克隆：NXP Host 同时打开来源 Boot Keyboard（接口 0、71 字节描述符）和 Boot Mouse（接口 1、185 字节描述符）；OTG1 动态生成两个 HID 接口，Linux 在 480 Mbit/s 下同时绑定两个 `usbhid`，端点均为 8 字节、`bInterval=4`。
 - 宏引擎迁移：RT1052 直接复用根工程 `macro_engine.rs` 和由同一 `macro_config.toml` 生成的配置；DWT 以实测默认核心时钟 528 MHz 累计微秒，物理/合成报告按来源接口解码、变换并重新编码。
+- 实测宏透明路径：过滤 NXP 零长度完成回调，并在 OTG1 Interrupt IN 暂忙时对共享报告队列施加背压；连续转发超过 896 个真实鼠标报告，左右键、X/Y 和滚轮正确，观测窗口内 `dropped=0`。
+- 实测热插拔：下游接收器拔出后 OTG1 立即停止，上游 Linux 设备消失；插回后逐项核验 VID/PID、接口参数及 71/185 字节 Report Descriptor，一致时自动重新连接，Linux 设备号从 77 更新为 78 且两个 `usbhid` 接口恢复。
 - RAM runner 修复：按 ELF `p_paddr` 加载 `.data` 初值，并从 ELF `_SEGGER_RTT` 符号定位日志控制块，避免链接布局变化导致静态初值或 RTT 读取错误。
 - 当前动态克隆范围：克隆最多 4 个带 Interrupt IN 的 HID 接口；暂未克隆原始字符串、Interrupt OUT，键盘 LED `SET_REPORT` 当前只确认接收不向下游转发；热插拔后仍需重新枚举 OTG1。
 - 当前阻塞：无。
-- 下一步：连接下游键盘完成宏触发实机验收，随后处理热插拔和 OTG1 自动重枚举；之后接入 Ethernet 控制面。
+- 下一步：连接下游键盘完成宏触发实机验收，再处理不同设备 profile 的运行期重建与 STALL/超时；之后接入 Ethernet 控制面。

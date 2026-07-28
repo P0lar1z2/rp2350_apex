@@ -242,6 +242,9 @@ fn main() -> ! {
         // SAFETY: `report` is valid writable storage matching the C ABI.
         while unsafe { nxp_host_pop_report(&mut report) } != 0 {
             let length = usize::from(report.length.min(64));
+            if report.status != 0 || length == 0 {
+                continue;
+            }
             if report.sequence <= 16 || (report.sequence & 127) == 0 || report.status != 0 {
                 rprintln!(
                     "report #{} HID[{}]/if={} status={} len={} data={:02x?}",
