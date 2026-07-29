@@ -25,6 +25,32 @@ static inline volatile uint32_t *reg32(uint32_t address) {
     return (volatile uint32_t *)(uintptr_t)address;
 }
 
+static void init_run_clock(void) {
+    const clock_arm_pll_config_t arm_pll = {
+        .loopDivider = 88U,
+        .src = kCLOCK_PllClkSrc24M,
+    };
+
+    CLOCK_SetXtalFreq(24000000U);
+    /* Move PERIPH_CLK to OSC24M while changing the ARM PLL and dividers. */
+    CLOCK_SetMux(kCLOCK_PeriphClk2Mux, 1U);
+    CLOCK_SetDiv(kCLOCK_PeriphClk2Div, 0U);
+    CLOCK_SetMux(kCLOCK_PeriphMux, 1U);
+
+    /* 1.25 V is the board SDK setting used before raising AHB/core clocks. */
+    DCDC->REG3 = (DCDC->REG3 & ~DCDC_REG3_TRG_MASK) | DCDC_REG3_TRG(0x12U);
+    while ((DCDC->REG0 & DCDC_REG0_STS_DC_OK_MASK) == 0U) {
+    }
+
+    CLOCK_InitArmPll(&arm_pll);
+    CLOCK_SetDiv(kCLOCK_AhbDiv, 0U);
+    CLOCK_SetDiv(kCLOCK_IpgDiv, 3U);
+    CLOCK_SetDiv(kCLOCK_ArmDiv, 1U);
+    CLOCK_SetMux(kCLOCK_PrePeriphMux, 3U);
+    CLOCK_SetMux(kCLOCK_PeriphMux, 0U);
+    SystemCoreClock = 528000000U;
+}
+
 static bool init_enet_pll(void) {
     volatile uint32_t *pll = reg32(0x400D80E0U);
     /* Match the board SDK's CLOCK_InitEnetPll({true, false, 1}) exactly. */
@@ -88,6 +114,7 @@ int32_t nxp_enet_init(void) {
     enet_config_t config;
     enet_buffer_config_t buffers;
     uint8_t mac[6] = {0x02, 0x10, 0x52, 0x00, 0x00, 0x01};
+    init_run_clock();
     /* Buffer descriptors are shared with DMA and must never remain in D-cache. */
     L1CACHE_DisableDCache();
     if (!init_board_phy()) {
@@ -111,16 +138,12 @@ int32_t nxp_enet_init(void) {
     if (ENET_Init(ENET, &s_handle, &config, &buffers, mac, 132000000U) != kStatus_Success) {
         return -2;
     }
-    /*
-     * This RT1052 Pro sample is reliable at 10BASE-T but its 100M RMII path
-     * fails the PHY-local byte-for-byte loopback diagnostic. Advertise only
-     * 10M modes so the external link uses the verified data path.
-     */
-    if (ENET_MDIOWrite(ENET, PHY_ADDRESS, 4U, 0x0061U) != kStatus_Success ||
+    /* Advertise 10/100 Mbit/s, half/full duplex, then restart negotiation. */
+    if (ENET_MDIOWrite(ENET, PHY_ADDRESS, 4U, 0x01E1U) != kStatus_Success ||
         ENET_MDIOWrite(ENET, PHY_ADDRESS, 0U, 0x1200U) != kStatus_Success) {
         return -3;
     }
-    ENET_SetMII(ENET, kENET_MiiSpeed10M, kENET_MiiFullDuplex);
+    ENET_SetMII(ENET, kENET_MiiSpeed100M, kENET_MiiFullDuplex);
     ENET_ActiveRead(ENET);
     s_initialized = true;
     return 0;
@@ -167,10 +190,10 @@ int32_t nxp_enet_send(const uint8_t *frame, uint32_t length) {
 
 int32_t nxp_enet_set_phy_loopback(uint8_t enable) {
     if (!s_initialized) return -1;
-    /* Exercise the verified 10 Mbit/s full-duplex RMII data path. */
-    uint16_t bmcr = enable != 0U ? 0x4100U : 0x1200U;
+    /* Exercise the 100 Mbit/s full-duplex RMII data path. */
+    uint16_t bmcr = enable != 0U ? 0x6100U : 0x1200U;
     if (enable != 0U) {
-        ENET_SetMII(ENET, kENET_MiiSpeed10M, kENET_MiiFullDuplex);
+        ENET_SetMII(ENET, kENET_MiiSpeed100M, kENET_MiiFullDuplex);
     }
     return ENET_MDIOWrite(ENET, PHY_ADDRESS, 0U, bmcr) == kStatus_Success ? 0 : -2;
 }

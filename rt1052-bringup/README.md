@@ -74,7 +74,9 @@ ACK, but it never blocks the USB data path.
 
 `enet_control` obtains its IPv4 configuration through DHCP and binds UDP port
 1052 only after a lease is configured. Its locally administered MAC address is
-`02:10:52:00:00:01`; hardware verification obtained `192.168.110.52/24` with
-gateway `192.168.110.1`. This board currently advertises only 10BASE-T modes:
-the PHY-local 10M loopback is byte-exact, while the 100M RMII path corrupts the
-test frame and is intentionally excluded until its signal timing is resolved.
+`02:10:52:00:00:01`; hardware verification obtained a DHCP lease on the
+`192.168.110.0/24` network with gateway `192.168.110.1`. The RAM loader must
+raise the core/AHB clock to 528 MHz and IPG to 132 MHz before starting ENET;
+with the Boot ROM's low-speed clock tree, 10M works but 100M frames are
+corrupted. With the RUN clock configured, the PHY-local 100M loopback is
+byte-exact and the external link negotiates 100M Full-Duplex.

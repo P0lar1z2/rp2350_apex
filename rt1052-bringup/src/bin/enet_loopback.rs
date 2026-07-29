@@ -13,6 +13,7 @@ unsafe extern "C" {
     fn nxp_enet_send(frame: *const u8, length: u32) -> c_int;
     fn nxp_enet_receive(frame: *mut u8, capacity: u32) -> c_int;
     fn nxp_enet_set_phy_loopback(enable: u8) -> c_int;
+    fn nxp_enet_cpu_hz() -> u32;
 }
 
 #[entry]
@@ -26,7 +27,9 @@ fn main() -> ! {
 
     // SAFETY: The C layer owns all ENET state and DMA storage.
     let init = unsafe { nxp_enet_init() };
-    rprintln!("ENET init={}", init);
+    // SAFETY: The clock query only reads clock-control registers.
+    let core_hz = unsafe { nxp_enet_cpu_hz() };
+    rprintln!("ENET init={} core={}Hz", init, core_hz);
     if init != 0 {
         loop {
             cortex_m::asm::nop();
