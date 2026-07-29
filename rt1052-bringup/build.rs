@@ -101,7 +101,14 @@ fn compile_nxp_host(manifest: &Path) {
 
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=nxp_usb_host");
-    println!("cargo:rerun-if-changed={}", manifest.join("csrc").display());
+    for source in [
+        "csrc/nxp_host_ffi.c",
+        "csrc/nxp_host_ffi.h",
+        "csrc/osa_baremetal.c",
+        "csrc/usb_host_config.h",
+    ] {
+        println!("cargo:rerun-if-changed={}", manifest.join(source).display());
+    }
 }
 
 fn compile_nxp_enet(manifest: &Path) {

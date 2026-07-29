@@ -13,7 +13,7 @@
 #define REPORT_DATA_CAPACITY (64U)
 #define HID_RX_BUFFER_SIZE (64U)
 #define HID_REPORT_DESCRIPTOR_CAPACITY (512U)
-#define MAX_HID_INTERFACES (4U)
+#define MAX_HID_INTERFACES (6U)
 
 typedef struct
 {
@@ -333,6 +333,32 @@ static uint32_t GetInfo(usb_device_handle device, usb_host_dev_info_t code)
     return value;
 }
 
+static void InitRunClock(void)
+{
+    const clock_arm_pll_config_t armPll = {
+        .loopDivider = 88U,
+        .src = kCLOCK_PllClkSrc24M,
+    };
+
+    CLOCK_SetXtalFreq(24000000U);
+    CLOCK_SetMux(kCLOCK_PeriphClk2Mux, 1U);
+    CLOCK_SetDiv(kCLOCK_PeriphClk2Div, 0U);
+    CLOCK_SetMux(kCLOCK_PeriphMux, 1U);
+
+    DCDC->REG3 = (DCDC->REG3 & ~DCDC_REG3_TRG_MASK) | DCDC_REG3_TRG(0x12U);
+    while ((DCDC->REG0 & DCDC_REG0_STS_DC_OK_MASK) == 0U)
+    {
+    }
+
+    CLOCK_InitArmPll(&armPll);
+    CLOCK_SetDiv(kCLOCK_AhbDiv, 0U);
+    CLOCK_SetDiv(kCLOCK_IpgDiv, 3U);
+    CLOCK_SetDiv(kCLOCK_ArmDiv, 1U);
+    CLOCK_SetMux(kCLOCK_PrePeriphMux, 3U);
+    CLOCK_SetMux(kCLOCK_PeriphMux, 0U);
+    SystemCoreClock = 528000000U;
+}
+
 static usb_status_t HostEvent(usb_device_handle device,
                               usb_host_configuration_handle configurationHandle,
                               uint32_t eventCode)
@@ -481,6 +507,7 @@ int32_t nxp_host_init(void)
 {
     usb_phy_config_struct_t phyConfig = {0x0CU, 0x06U, 0x06U};
 
+    InitRunClock();
     (void)CLOCK_EnableUsbhs1PhyPllClock(kCLOCK_Usbphy480M, 480000000U);
     (void)CLOCK_EnableUsbhs1Clock(kCLOCK_Usb480M, 480000000U);
     (void)USB_EhciPhyInit(HOST_CONTROLLER_ID, 24000000U, &phyConfig);
@@ -595,5 +622,6 @@ int32_t nxp_device_init_clocks(void)
 
 uint32_t nxp_core_clock_hz(void)
 {
+    SystemCoreClockUpdate();
     return SystemCoreClock;
 }

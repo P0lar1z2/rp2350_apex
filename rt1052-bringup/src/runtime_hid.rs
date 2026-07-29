@@ -18,7 +18,7 @@ const REQUEST_SET_IDLE: u8 = 0x0a;
 const REQUEST_SET_PROTOCOL: u8 = 0x0b;
 
 pub const MAX_REPORT_DESCRIPTOR: usize = 512;
-pub const MAX_HID_INTERFACES: usize = 4;
+pub const MAX_HID_INTERFACES: usize = 6;
 
 #[derive(Clone, Copy)]
 pub struct RuntimeHidInterface<'a> {
