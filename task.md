@@ -49,6 +49,8 @@
 - [x] 根据来源设备描述符创建单个 HID 接口和 Interrupt IN 端点。
 - [x] 按来源速度换算上游 High-Speed `bInterval`：8K 来源保持 1，当前 Full-Speed 1 ms 来源转换为 4。
 - [x] 完成来源复合 HID 的动态接口/描述符克隆。
+- [x] Host 为每个 HID 接口保存独立物理设备句柄，支持 Hub 下鼠标、键盘来自两个设备。
+- [ ] 实机验收两个独立物理 HID 同时接入、任意顺序重插及按设备释放。
 - [ ] 完成宏引擎实机触发验收（代码、共享配置和 20 项单元测试已迁移；待下游键盘操作）。
 - [x] 复用现有无分配 Rust HID Report Descriptor 解析器，并在 RT1052 实机解码鼠标报告。
 - [x] 相同来源 profile 热插拔时断开 OTG1，重新核验全部接口描述符后自动重新枚举。
@@ -88,6 +90,7 @@
 - 宏引擎迁移：RT1052 直接复用根工程 `macro_engine.rs` 和由同一 `macro_config.toml` 生成的配置；DWT 以实测默认核心时钟 528 MHz 累计微秒，物理/合成报告按来源接口解码、变换并重新编码。
 - 实测宏透明路径：过滤 NXP 零长度完成回调，并在 OTG1 Interrupt IN 暂忙时对共享报告队列施加背压；连续转发超过 896 个真实鼠标报告，左右键、X/Y 和滚轮正确，观测窗口内 `dropped=0`。
 - 实测热插拔：下游接收器拔出后 OTG1 立即停止，上游 Linux 设备消失；插回后逐项核验 VID/PID、接口参数及 71/185 字节 Report Descriptor，一致时自动重新连接，Linux 设备号从 77 更新为 78 且两个 `usbhid` 接口恢复。
+- 多物理设备支持：NXP Host 已去除单一 `s_hidDevice`，最多 4 个 HID 接口分别保存设备句柄和 Hub 端口；Rust 在收齐键盘与鼠标 profile 后创建复合设备，重插时按接口参数与完整 Report Descriptor 重建 Host 槽到上游接口的映射，不依赖插入顺序。
 - RAM runner 修复：按 ELF `p_paddr` 加载 `.data` 初值，并从 ELF `_SEGGER_RTT` 符号定位日志控制块，避免链接布局变化导致静态初值或 RTT 读取错误。
 - 当前动态克隆范围：克隆最多 4 个带 Interrupt IN 的 HID 接口；暂未克隆原始字符串、Interrupt OUT，键盘 LED `SET_REPORT` 当前只确认接收不向下游转发；热插拔后仍需重新枚举 OTG1。
 - Ethernet 板级参数：Pro 底板使用 LAN8720 系列 PHY，MDIO 地址 0；GPIO1_IO09 为复位，GPIO1_IO10 需在复位前拉高；RT1052 从 GPIO_B1_10 输出 50 MHz RMII REF_CLK。
@@ -97,4 +100,4 @@
 - 异步控制协议：已定义无分配 `RTCP` v1 报文、启停/切层/触发/释放/全释放命令、异步 ACK 编码和满载即丢新命令的有界队列；UDP 1052 socket 已接入。
 - Rust 网络适配：已将 NXP ENET 的轮询式收发封装为 `smoltcp` 0.13.1 `Device`，保持 no_std、无堆分配，并加入 DHCPv4 与 UDP socket。
 - DHCP 控制固件：等待 PHY 链路后广播 DHCP DISCOVER，获得租约后才启用 UDP 1052；100M Full-Duplex 实测 MAC `02:10:52:00:00:01` 获得 `192.168.110.53/24`，网关 `192.168.110.1`。
-- 下一步：验收 UDP `RTCP` 命令/异步 ACK，再将控制队列接入桥接固件；连接下游键盘后补做宏触发实机验收。
+- 下一步：实机验收独立鼠标与键盘同时接入和任意顺序重插；随后验收 UDP `RTCP` 命令/异步 ACK，并将控制队列接入桥接固件。

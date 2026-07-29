@@ -171,6 +171,57 @@ fn merge_mouse(physical: MouseState, generated: MacroMouseReport) -> MouseState 
     }
 }
 
+fn empty_mouse() -> MouseState {
+    MouseState {
+        buttons: 0,
+        x: 0,
+        y: 0,
+        wheel: 0,
+        pan: 0,
+    }
+}
+
+fn source_profiles_include_keyboard_and_mouse(
+    attached_mask: u8,
+    descriptors: &[[u8; 512]; MAX_HID_INTERFACES],
+    descriptor_lens: &[usize; MAX_HID_INTERFACES],
+) -> bool {
+    let mut keyboard = false;
+    let mut mouse = false;
+    let mut encoded = [0u8; 64];
+
+    for index in 0..MAX_HID_INTERFACES {
+        let length = descriptor_lens[index];
+        if attached_mask & (1 << index) == 0 || length == 0 {
+            continue;
+        }
+        let decoder = parse_report_descriptor(&descriptors[index][..length]);
+        keyboard |= decoder
+            .encode_new(
+                &DecodedReport::Keyboard(KeyboardState::empty()),
+                &mut encoded,
+            )
+            .is_ok();
+        mouse |= decoder
+            .encode_new(&DecodedReport::Mouse(empty_mouse()), &mut encoded)
+            .is_ok();
+    }
+
+    keyboard && mouse
+}
+
+fn same_source_profile(actual: HostEvent, expected: HostEvent) -> bool {
+    actual.vid == expected.vid
+        && actual.pid == expected.pid
+        && actual.speed == expected.speed
+        && actual.interface_number == expected.interface_number
+        && actual.interface_subclass == expected.interface_subclass
+        && actual.interface_protocol == expected.interface_protocol
+        && actual.endpoint_address == expected.endpoint_address
+        && actual.max_packet_size == expected.max_packet_size
+        && actual.interval == expected.interval
+}
+
 #[inline]
 fn write32(address: usize, value: u32) {
     // SAFETY: Callers provide valid, aligned RT1052 register/vector addresses.
@@ -218,16 +269,18 @@ fn main() -> ! {
     // SAFETY: The USB2 vector and peripheral state are initialized above.
     unsafe { cortex_m::interrupt::enable() };
 
-    rprintln!("waiting for OTG2 source profile before attaching OTG1");
+    rprintln!("waiting for OTG2 keyboard and mouse profiles before attaching OTG1");
     let mut sources = [HostEvent::empty(); MAX_HID_INTERFACES];
     let mut report_descriptors = [[0u8; 512]; MAX_HID_INTERFACES];
     let mut report_descriptor_lens = [0usize; MAX_HID_INTERFACES];
     let mut attached_mask = 0u8;
     let mut descriptor_done_mask = 0u8;
+    let mut source_roles_ready = false;
     'profile: loop {
         // SAFETY: Called only from this main loop; USB2 IRQ handles controller events.
         unsafe { nxp_host_task() };
         let mut event = HostEvent::empty();
+        let mut profile_changed = false;
         // SAFETY: `event` is writable storage matching the C ABI.
         while unsafe { nxp_host_pop_event(&mut event) } != 0 {
             match event.kind {
@@ -236,6 +289,7 @@ fn main() -> ! {
                     if index < MAX_HID_INTERFACES {
                         sources[index] = event;
                         attached_mask |= 1 << index;
+                        profile_changed = true;
                     }
                     rprintln!(
                         "source[{}] if={} {:04x}:{:04x} speed={} subclass={} protocol={} packet={} interval={}",
@@ -251,10 +305,18 @@ fn main() -> ! {
                     );
                 }
                 2 => {
-                    attached_mask = 0;
-                    descriptor_done_mask = 0;
-                    report_descriptor_lens.fill(0);
-                    rprintln!("source detached while reading profile");
+                    let index = usize::from(event.interface_index);
+                    if index < MAX_HID_INTERFACES {
+                        attached_mask &= !(1 << index);
+                        descriptor_done_mask &= !(1 << index);
+                        report_descriptor_lens[index] = 0;
+                        sources[index] = HostEvent::empty();
+                        profile_changed = true;
+                    }
+                    rprintln!(
+                        "source[{}] detached while reading profile",
+                        event.interface_index
+                    );
                 }
                 3 => rprintln!("OTG2 enumeration failed status={}", event.status),
                 4 if event.status == 0 => {
@@ -293,6 +355,7 @@ fn main() -> ! {
                             );
                         }
                         descriptor_done_mask |= 1 << index;
+                        profile_changed = true;
                     }
                 }
                 _ => {}
@@ -301,7 +364,14 @@ fn main() -> ! {
         let mut stale_report = HostReport::empty();
         // Avoid filling the shared queue while all interface descriptors arrive.
         while unsafe { nxp_host_pop_report(&mut stale_report) } != 0 {}
-        if attached_mask != 0 && descriptor_done_mask == attached_mask {
+        if profile_changed && attached_mask != 0 && descriptor_done_mask == attached_mask {
+            source_roles_ready = source_profiles_include_keyboard_and_mouse(
+                attached_mask,
+                &report_descriptors,
+                &report_descriptor_lens,
+            );
+        }
+        if source_roles_ready {
             break 'profile;
         }
     }
@@ -395,13 +465,7 @@ fn main() -> ! {
     let mut mouse_template = [0u8; 64];
     let mut mouse_template_len = 0usize;
     let empty_keyboard = DecodedReport::Keyboard(KeyboardState::empty());
-    let empty_mouse = DecodedReport::Mouse(MouseState {
-        buttons: 0,
-        x: 0,
-        y: 0,
-        wheel: 0,
-        pan: 0,
-    });
+    let empty_mouse = DecodedReport::Mouse(empty_mouse());
     for (index, decoder) in decoders.iter().enumerate() {
         if keyboard_interface.is_none()
             && let Ok(length) = decoder.encode_new(&empty_keyboard, &mut keyboard_template)
@@ -433,10 +497,19 @@ fn main() -> ! {
     let mut pending_len = [0usize; MAX_HID_INTERFACES];
     let mut pending_ready = [false; MAX_HID_INTERFACES];
     let mut source_connected = true;
-    let mut reconnect_attached_mask = 0u8;
-    let mut reconnect_descriptor_mask = 0u8;
-    let mut reconnect_matches = true;
-    let mut reconnect_checked = false;
+    let profile_mask = profiles
+        .iter()
+        .enumerate()
+        .fold(0u8, |mask, (index, profile)| {
+            if profile.is_some() {
+                mask | (1 << index)
+            } else {
+                mask
+            }
+        });
+    let mut current_sources = sources;
+    let mut host_to_profile: [Option<usize>; MAX_HID_INTERFACES] =
+        core::array::from_fn(|index| profiles[index].map(|_| index));
     let mut reconnect_descriptor = [0u8; 512];
 
     loop {
@@ -519,46 +592,45 @@ fn main() -> ! {
         while unsafe { nxp_host_pop_event(&mut event) } != 0 {
             match event.kind {
                 1 => {
-                    if !source_connected && !reconnect_checked {
-                        let index = usize::from(event.interface_index);
-                        if index < MAX_HID_INTERFACES {
-                            let expected = sources[index];
-                            reconnect_attached_mask |= 1 << index;
-                            reconnect_matches &= attached_mask & (1 << index) != 0
-                                && event.vid == expected.vid
-                                && event.pid == expected.pid
-                                && event.speed == expected.speed
-                                && event.interface_number == expected.interface_number
-                                && event.interface_subclass == expected.interface_subclass
-                                && event.interface_protocol == expected.interface_protocol
-                                && event.max_packet_size == expected.max_packet_size
-                                && event.interval == expected.interval;
-                        } else {
-                            reconnect_matches = false;
-                        }
+                    let index = usize::from(event.interface_index);
+                    if index < MAX_HID_INTERFACES {
+                        current_sources[index] = event;
+                        host_to_profile[index] = None;
                     }
                     rprintln!(
-                        "OTG2 HID[{}] {:04x}:{:04x} speed={} ep={:#04x} interval={}",
+                        "OTG2 HID[{}] {:04x}:{:04x} addr={} hub={}:{} speed={} ep={:#04x} interval={}",
                         event.interface_index,
                         event.vid,
                         event.pid,
+                        event.address,
+                        event.hub_address,
+                        event.hub_port,
                         event.speed,
                         event.endpoint_address,
                         event.interval
                     );
                 }
                 2 => {
-                    if source_connected {
+                    let host_index = usize::from(event.interface_index);
+                    let removed_profile = if host_index < MAX_HID_INTERFACES {
+                        current_sources[host_index] = HostEvent::empty();
+                        host_to_profile[host_index].take()
+                    } else {
+                        None
+                    };
+                    if removed_profile.is_some() && source_connected {
                         set_upstream_attached(false);
                         source_connected = false;
                         device_configured = false;
                         pending_ready.fill(false);
                         macro_engine = MacroEngine::new(&MACRO_CONFIG, macro_seed);
-                        reconnect_attached_mask = 0;
-                        reconnect_descriptor_mask = 0;
-                        reconnect_matches = true;
-                        reconnect_checked = false;
-                        rprintln!("OTG2 HID detached; OTG1 disconnected from PC");
+                        rprintln!(
+                            "OTG2 HID[{}] profile {:?} detached; OTG1 disconnected from PC",
+                            event.interface_index,
+                            removed_profile
+                        );
+                    } else {
+                        rprintln!("OTG2 HID[{}] detached", event.interface_index);
                     }
                 }
                 3 => rprintln!("OTG2 enumeration failed status={}", event.status),
@@ -571,29 +643,37 @@ fn main() -> ! {
                     event.status
                 ),
                 5 if event.status == 0 => {
-                    if !source_connected && !reconnect_checked {
-                        let index = usize::from(event.interface_index);
-                        if index < MAX_HID_INTERFACES && reconnect_attached_mask & (1 << index) != 0
-                        {
-                            let length = unsafe {
-                                nxp_host_copy_report_descriptor(
-                                    event.interface_index,
-                                    reconnect_descriptor.as_mut_ptr(),
-                                    512,
-                                )
-                            };
-                            let length = usize::try_from(length).unwrap_or(0);
-                            reconnect_matches &= length == report_descriptor_lens[index]
-                                && reconnect_descriptor[..length]
-                                    == report_descriptors[index][..length];
-                            reconnect_descriptor_mask |= 1 << index;
-                        } else {
-                            reconnect_matches = false;
-                        }
+                    let host_index = usize::from(event.interface_index);
+                    if host_index >= MAX_HID_INTERFACES {
+                        continue;
                     }
+                    let length = unsafe {
+                        nxp_host_copy_report_descriptor(
+                            event.interface_index,
+                            reconnect_descriptor.as_mut_ptr(),
+                            512,
+                        )
+                    };
+                    let length = usize::try_from(length).unwrap_or(0);
+                    let matched_profile = (0..MAX_HID_INTERFACES).find(|&profile_index| {
+                        profile_mask & (1 << profile_index) != 0
+                            && !host_to_profile.contains(&Some(profile_index))
+                            && same_source_profile(
+                                current_sources[host_index],
+                                sources[profile_index],
+                            )
+                            && length == report_descriptor_lens[profile_index]
+                            && reconnect_descriptor[..length]
+                                == report_descriptors[profile_index][..length]
+                    });
+                    host_to_profile[host_index] = matched_profile;
+                    rprintln!(
+                        "OTG2 HID[{}] matched upstream profile {:?}",
+                        event.interface_index,
+                        matched_profile
+                    );
                 }
                 5 => {
-                    reconnect_matches = false;
                     rprintln!(
                         "OTG2 HID[{}] descriptor failed status={}",
                         event.interface_index,
@@ -603,19 +683,13 @@ fn main() -> ! {
                 _ => {}
             }
         }
-        if !source_connected
-            && !reconnect_checked
-            && reconnect_attached_mask != 0
-            && reconnect_descriptor_mask == reconnect_attached_mask
-        {
-            reconnect_checked = true;
-            if reconnect_matches && reconnect_attached_mask == attached_mask {
-                set_upstream_attached(true);
-                source_connected = true;
-                rprintln!("matching OTG2 HID profile restored; OTG1 reattached");
-            } else {
-                rprintln!("new OTG2 HID profile differs; OTG1 remains disconnected");
-            }
+        let mapped_profile_mask = host_to_profile.iter().fold(0u8, |mask, profile| {
+            profile.map_or(mask, |index| mask | (1 << index))
+        });
+        if !source_connected && mapped_profile_mask == profile_mask {
+            set_upstream_attached(true);
+            source_connected = true;
+            rprintln!("all OTG2 HID profiles restored; OTG1 reattached");
         }
 
         if pending_ready.iter().any(|ready| *ready) {
@@ -624,8 +698,11 @@ fn main() -> ! {
         let mut report = HostReport::empty();
         // SAFETY: `report` is writable storage matching the C ABI.
         while unsafe { nxp_host_pop_report(&mut report) } != 0 {
-            let index = usize::from(report.interface_index);
-            if !source_connected || index >= MAX_HID_INTERFACES || profiles[index].is_none() {
+            let host_index = usize::from(report.interface_index);
+            let Some(index) = host_to_profile.get(host_index).copied().flatten() else {
+                continue;
+            };
+            if !source_connected || profiles[index].is_none() {
                 continue;
             }
             let length = usize::from(report.length.min(64));

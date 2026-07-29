@@ -19,23 +19,28 @@ typedef struct
 {
     uint8_t occupied;
     uint8_t openStarted;
+    uint8_t speed;
+    uint8_t address;
+    uint8_t hubAddress;
+    uint8_t hubPort;
     uint8_t interfaceIndex;
     uint8_t interfaceNumber;
     uint8_t interfaceSubclass;
     uint8_t interfaceProtocol;
     uint8_t endpointAddress;
     uint8_t interval;
+    uint16_t vid;
+    uint16_t pid;
     uint16_t packetSize;
     uint16_t reportDescriptorLength;
     volatile uint16_t reportDescriptorActualLength;
+    usb_device_handle deviceHandle;
     usb_host_interface_handle interfaceHandle;
     usb_host_class_handle classHandle;
     volatile uint8_t receiveArmed;
 } hid_slot_t;
 
 static usb_host_handle s_hostHandle;
-static usb_device_handle s_hidDevice;
-static usb_host_configuration_handle s_hidConfiguration;
 static hid_slot_t s_hidSlots[MAX_HID_INTERFACES];
 __attribute__((section(".usb_dma.hid_rx"), aligned(32)))
 static uint8_t s_hidRxBuffers[MAX_HID_INTERFACES][HID_RX_BUFFER_SIZE];
@@ -111,6 +116,12 @@ static uint16_t FindReportDescriptorLength(const usb_host_interface_t *interface
 
 static void FillSlotEvent(nxp_host_event_t *event, const hid_slot_t *slot)
 {
+    event->speed             = slot->speed;
+    event->address           = slot->address;
+    event->hubAddress        = slot->hubAddress;
+    event->hubPort           = slot->hubPort;
+    event->vid               = slot->vid;
+    event->pid               = slot->pid;
     event->interfaceNumber   = slot->interfaceNumber;
     event->interfaceSubclass = slot->interfaceSubclass;
     event->interfaceProtocol = slot->interfaceProtocol;
@@ -269,7 +280,7 @@ static void StartNextHidInterface(void)
         }
         slot->openStarted = 1U;
         interface = (usb_host_interface_t *)slot->interfaceHandle;
-        status = USB_HostHidInit(s_hidDevice, &slot->classHandle);
+        status = USB_HostHidInit(slot->deviceHandle, &slot->classHandle);
         if (status == kStatus_USB_Success)
         {
             status = USB_HostHidSetInterface(slot->classHandle,
@@ -326,30 +337,43 @@ static usb_status_t HostEvent(usb_device_handle device,
             {
                 return kStatus_USB_NotSupported;
             }
-            s_hidDevice        = device;
-            s_hidConfiguration = configurationHandle;
             return kStatus_USB_Success;
         }
 
         case kUSB_HostEventEnumerationDone:
-            if ((device == s_hidDevice) && (configurationHandle == s_hidConfiguration))
             {
-                uint8_t slotIndex = 0U;
                 configuration = (usb_host_configuration_t *)configurationHandle;
-                for (interfaceIndex = 0U;
-                     (interfaceIndex < configuration->interfaceCount) &&
-                     (slotIndex < MAX_HID_INTERFACES);
+                for (interfaceIndex = 0U; interfaceIndex < configuration->interfaceCount;
                      ++interfaceIndex)
                 {
                     usb_host_interface_t *interface = &configuration->interfaceList[interfaceIndex];
-                    hid_slot_t *slot;
+                    hid_slot_t *slot = NULL;
                     nxp_host_event_t event = {0};
+                    uint8_t slotIndex;
                     if (interface->interfaceDesc->bInterfaceClass != USB_HOST_HID_CLASS_CODE)
                     {
                         continue;
                     }
-                    slot = &s_hidSlots[slotIndex];
+                    for (slotIndex = 0U; slotIndex < MAX_HID_INTERFACES; ++slotIndex)
+                    {
+                        if (s_hidSlots[slotIndex].occupied == 0U)
+                        {
+                            slot = &s_hidSlots[slotIndex];
+                            break;
+                        }
+                    }
+                    if (slot == NULL)
+                    {
+                        break;
+                    }
                     *slot = (hid_slot_t){0};
+                    slot->deviceHandle = device;
+                    slot->speed = (uint8_t)GetInfo(device, kUSB_HostGetDeviceSpeed);
+                    slot->address = (uint8_t)GetInfo(device, kUSB_HostGetDeviceAddress);
+                    slot->hubAddress = (uint8_t)GetInfo(device, kUSB_HostGetDeviceHubNumber);
+                    slot->hubPort = (uint8_t)GetInfo(device, kUSB_HostGetDevicePortNumber);
+                    slot->vid = (uint16_t)GetInfo(device, kUSB_HostGetDeviceVID);
+                    slot->pid = (uint16_t)GetInfo(device, kUSB_HostGetDevicePID);
                     slot->interfaceIndex = slotIndex;
                     slot->interfaceNumber = interface->interfaceDesc->bInterfaceNumber;
                     slot->interfaceSubclass = interface->interfaceDesc->bInterfaceSubClass;
@@ -376,43 +400,38 @@ static usb_status_t HostEvent(usb_device_handle device,
                         continue;
                     }
                     slot->occupied = 1U;
-                    event.kind       = NXP_HOST_EVENT_HID_ATTACHED;
-                    event.speed      = (uint8_t)GetInfo(device, kUSB_HostGetDeviceSpeed);
-                    event.address    = (uint8_t)GetInfo(device, kUSB_HostGetDeviceAddress);
-                    event.hubAddress = (uint8_t)GetInfo(device, kUSB_HostGetDeviceHubNumber);
-                    event.hubPort    = (uint8_t)GetInfo(device, kUSB_HostGetDevicePortNumber);
-                    event.vid        = (uint16_t)GetInfo(device, kUSB_HostGetDeviceVID);
-                    event.pid        = (uint16_t)GetInfo(device, kUSB_HostGetDevicePID);
+                    event.kind = NXP_HOST_EVENT_HID_ATTACHED;
                     FillSlotEvent(&event, slot);
                     PushEvent(&event);
-                    ++slotIndex;
                 }
                 StartNextHidInterface();
             }
             return kStatus_USB_Success;
 
         case kUSB_HostEventDetach:
-            if (device == s_hidDevice)
             {
                 uint8_t index;
-                nxp_host_event_t event = {0};
-                event.kind             = NXP_HOST_EVENT_DETACHED;
-                PushEvent(&event);
                 for (index = 0U; index < MAX_HID_INTERFACES; ++index)
                 {
                     hid_slot_t *slot = &s_hidSlots[index];
+                    nxp_host_event_t event = {0};
                     usb_host_class_handle classHandle = slot->classHandle;
+                    if ((slot->occupied == 0U) || (slot->deviceHandle != device))
+                    {
+                        continue;
+                    }
+                    event.kind = NXP_HOST_EVENT_DETACHED;
+                    FillSlotEvent(&event, slot);
                     slot->occupied = 0U;
                     slot->receiveArmed = 0U;
                     slot->classHandle = NULL;
+                    PushEvent(&event);
                     if (classHandle != NULL)
                     {
                         (void)USB_HostHidDeinit(device, classHandle);
                     }
                     *slot = (hid_slot_t){0};
                 }
-                s_hidDevice        = NULL;
-                s_hidConfiguration = NULL;
             }
             return kStatus_USB_Success;
 
