@@ -9,6 +9,9 @@ default = []
 nxp-host = []
 nxp-enet = ["dep:smoltcp"]
 nxp-device = ["dep:imxrt-ral", "dep:imxrt-usbd", "dep:usb-device"]
+# Link the application at 0x60002000 for ROM boot from external FlexSPI NOR.
+# The 8 KiB FCB/IVT header is assembled by tools/flash.py.
+flash-xip = []
 
 [dependencies]
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }

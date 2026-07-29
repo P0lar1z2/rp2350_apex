@@ -1,8 +1,8 @@
 # RT1052 Pro Rust bring-up
 
-RAM-only Rust bring-up for the EmbedFire i.MX RT1052 Pro board with a
-`MIMXRT1052CVL5B`. The external W25Q256 FlexSPI flash is not erased or
-programmed.
+Rust bring-up for the EmbedFire i.MX RT1052 Pro board with a
+`MIMXRT1052CVL5B`. Development remains RAM-first; a guarded W25Q256 backup,
+boot-image, programming, and readback-verification flow is also available.
 
 ## Programs
 
@@ -54,6 +54,44 @@ is not erased or programmed.
 
 With the five-wire fireDAP connection, a lost debug session may require pressing
 the board's physical `RESET/RST` button or power-cycling before the next launch.
+
+## FlexSPI Flash
+
+The Flash workflow uses pyOCD's `mimxrt1050_quadspi` target. It preserves the
+known-good 8 KiB board-specific FCB/IVT/DCD header already on the board, links
+the Rust application at `0x60002000`, and verifies the programmed bytes by
+reading them back. A `flash` operation always saves and validates the complete
+32 MiB W25Q256 first; `.flash/` is ignored by Git.
+
+Install the pinned programmer once into the ignored local environment:
+
+```sh
+python3 -m venv .venv-pyocd
+.venv-pyocd/bin/pip install pyocd==0.45.1
+```
+
+```sh
+# Read-only backup. Global options must precede the subcommand.
+./tools/flash.py backup
+
+# Offline image build from a validated backup.
+./tools/flash.py build .flash/w25q256-YYYYMMDD-HHMMSS.bin
+
+# Destructive step: backup again, erase only occupied sectors, program, verify.
+./tools/flash.py flash --yes
+
+# Retry readback/boot only after a transient DAP reconnect failure.
+./tools/flash.py verify .flash/hid_bridge-rt1052-boot.bin
+```
+
+The generated image is `.flash/hid_bridge-rt1052-boot.bin`. Without `--yes`,
+the `flash` command stops after backup and image creation. Keep at least one
+full backup outside the repository before programming. The workflow does not
+burn eFuses and does not perform a whole-chip erase.
+
+Hardware verification programmed 108,576 image bytes after erasing two 64 KiB
+sectors. The complete programmed range matched its SHA-256 readback, then an
+NRST boot enumerated the five-interface `RT1052 Composite HID Clone` on OTG1.
 
 The intended wiring is OTG2 to the board's FE1.1S hub and mouse, while OTG1 is
 connected to the PC. `host_enumerate` only exercises OTG2.

@@ -246,6 +246,7 @@ unsafe extern "C" fn usb_otg2_irq() {
 fn main() -> ! {
     rt1052_bringup::use_nxp_default_flexram();
     cortex_m::interrupt::disable();
+    rt1052_bringup::prepare_runtime_memory();
     write32(SCB_VTOR, 0);
     rtt_init_print!(NoBlockSkip, 4096);
 

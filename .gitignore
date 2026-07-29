@@ -126,3 +126,7 @@ __pycache__/
 # Local vendor documentation and tool bundles; not part of this firmware.
 /野火【i.MX RT1052开发板】光盘资料/
 /.vendor/
+
+# Local RT1052 Flash backups and generated boot images.
+/rt1052-bringup/.flash/
+/rt1052-bringup/.venv-pyocd/

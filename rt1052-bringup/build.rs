@@ -174,6 +174,10 @@ fn main() {
     println!("cargo:rustc-link-search={}", env!("CARGO_MANIFEST_DIR"));
     println!("cargo:rerun-if-changed=memory.x");
 
+    if env::var_os("CARGO_FEATURE_FLASH_XIP").is_some() {
+        println!("cargo:rustc-link-arg=--defsym=__flash_xip=1");
+    }
+
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
     let previous_dir = env::current_dir().expect("build script current directory");
     let repository = manifest
