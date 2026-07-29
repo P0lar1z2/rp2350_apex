@@ -42,6 +42,7 @@ typedef struct
 
 static usb_host_handle s_hostHandle;
 static hid_slot_t s_hidSlots[MAX_HID_INTERFACES];
+static hid_slot_t *s_openingSlot;
 __attribute__((section(".usb_dma.hid_rx"), aligned(32)))
 static uint8_t s_hidRxBuffers[MAX_HID_INTERFACES][HID_RX_BUFFER_SIZE];
 __attribute__((section(".usb_dma.hid_report"), aligned(32)))
@@ -182,6 +183,10 @@ static void HidDescriptorCallback(void *param, uint8_t *data, uint32_t dataLen, 
     if (slot->occupied != 0U)
     {
         PushDescriptorEvent(slot, status, dataLen);
+        if (s_openingSlot == slot)
+        {
+            s_openingSlot = NULL;
+        }
         StartNextHidInterface();
     }
 }
@@ -237,6 +242,10 @@ static void HidInterfaceCallback(void *param, uint8_t *data, uint32_t dataLen, u
         FillSlotEvent(&readyEvent, slot);
         PushEvent(&readyEvent);
         PushDescriptorEvent(slot, status, 0U);
+        if (s_openingSlot == slot)
+        {
+            s_openingSlot = NULL;
+        }
         StartNextHidInterface();
         return;
     }
@@ -259,16 +268,28 @@ static void HidInterfaceCallback(void *param, uint8_t *data, uint32_t dataLen, u
             return;
         }
         PushDescriptorEvent(slot, descriptorStatus, 0U);
+        if (s_openingSlot == slot)
+        {
+            s_openingSlot = NULL;
+        }
         StartNextHidInterface();
         return;
     }
     PushDescriptorEvent(slot, kStatus_USB_Error, 0U);
+    if (s_openingSlot == slot)
+    {
+        s_openingSlot = NULL;
+    }
     StartNextHidInterface();
 }
 
 static void StartNextHidInterface(void)
 {
     uint8_t index;
+    if (s_openingSlot != NULL)
+    {
+        return;
+    }
     for (index = 0U; index < MAX_HID_INTERFACES; ++index)
     {
         hid_slot_t *slot = &s_hidSlots[index];
@@ -279,6 +300,7 @@ static void StartNextHidInterface(void)
             continue;
         }
         slot->openStarted = 1U;
+        s_openingSlot = slot;
         interface = (usb_host_interface_t *)slot->interfaceHandle;
         status = USB_HostHidInit(slot->deviceHandle, &slot->classHandle);
         if (status == kStatus_USB_Success)
@@ -297,6 +319,7 @@ static void StartNextHidInterface(void)
             FillSlotEvent(&readyEvent, slot);
             PushEvent(&readyEvent);
             PushDescriptorEvent(slot, status, 0U);
+            s_openingSlot = NULL;
             continue;
         }
         return;
@@ -422,6 +445,10 @@ static usb_status_t HostEvent(usb_device_handle device,
                     }
                     event.kind = NXP_HOST_EVENT_DETACHED;
                     FillSlotEvent(&event, slot);
+                    if (s_openingSlot == slot)
+                    {
+                        s_openingSlot = NULL;
+                    }
                     slot->occupied = 0U;
                     slot->receiveArmed = 0U;
                     slot->classHandle = NULL;
@@ -432,6 +459,7 @@ static usb_status_t HostEvent(usb_device_handle device,
                     }
                     *slot = (hid_slot_t){0};
                 }
+                StartNextHidInterface();
             }
             return kStatus_USB_Success;
 

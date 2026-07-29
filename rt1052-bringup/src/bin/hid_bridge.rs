@@ -33,6 +33,7 @@ const DEMCR: usize = 0xE000_EDFC;
 const DWT_CTRL: usize = 0xE000_1000;
 const DWT_CYCCNT: usize = 0xE000_1004;
 const USB1_USBCMD: usize = 0x402E_0140;
+const SOURCE_PROFILE_SETTLE_US: u32 = 1_000_000;
 
 #[unsafe(link_section = ".usb_device.endpoint_memory")]
 static EP_MEMORY: EndpointMemory<2048> = EndpointMemory::new();
@@ -269,6 +270,8 @@ fn main() -> ! {
     // SAFETY: The USB2 vector and peripheral state are initialized above.
     unsafe { cortex_m::interrupt::enable() };
 
+    let core_hz = unsafe { nxp_core_clock_hz() };
+    let mut clock = CycleClock::new(core_hz);
     rprintln!("waiting for OTG2 keyboard and mouse profiles before attaching OTG1");
     let mut sources = [HostEvent::empty(); MAX_HID_INTERFACES];
     let mut report_descriptors = [[0u8; 512]; MAX_HID_INTERFACES];
@@ -276,6 +279,7 @@ fn main() -> ! {
     let mut attached_mask = 0u8;
     let mut descriptor_done_mask = 0u8;
     let mut source_roles_ready = false;
+    let mut profile_stable_since = clock.now_us();
     'profile: loop {
         // SAFETY: Called only from this main loop; USB2 IRQ handles controller events.
         unsafe { nxp_host_task() };
@@ -364,14 +368,20 @@ fn main() -> ! {
         let mut stale_report = HostReport::empty();
         // Avoid filling the shared queue while all interface descriptors arrive.
         while unsafe { nxp_host_pop_report(&mut stale_report) } != 0 {}
-        if profile_changed && attached_mask != 0 && descriptor_done_mask == attached_mask {
-            source_roles_ready = source_profiles_include_keyboard_and_mouse(
-                attached_mask,
-                &report_descriptors,
-                &report_descriptor_lens,
-            );
+        if profile_changed {
+            source_roles_ready = false;
+            profile_stable_since = clock.now_us();
+            if attached_mask != 0 && descriptor_done_mask == attached_mask {
+                source_roles_ready = source_profiles_include_keyboard_and_mouse(
+                    attached_mask,
+                    &report_descriptors,
+                    &report_descriptor_lens,
+                );
+            }
         }
-        if source_roles_ready {
+        if source_roles_ready
+            && clock.now_us().wrapping_sub(profile_stable_since) >= SOURCE_PROFILE_SETTLE_US
+        {
             break 'profile;
         }
     }
@@ -480,8 +490,6 @@ fn main() -> ! {
             mouse_template_len = length;
         }
     }
-    let core_hz = unsafe { nxp_core_clock_hz() };
-    let mut clock = CycleClock::new(core_hz);
     let macro_seed = u64::from(core_hz) ^ (u64::from(identity.vid) << 32) ^ u64::from(identity.pid);
     let mut macro_engine = MacroEngine::new(&MACRO_CONFIG, macro_seed);
     rprintln!(
