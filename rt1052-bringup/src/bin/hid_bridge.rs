@@ -363,6 +363,15 @@ fn main() -> ! {
                         profile_changed = true;
                     }
                 }
+                6 => rprintln!(
+                    "source[{}] if={} endpoint={:#04x} attributes={:#04x} packet={} interval={}",
+                    event.interface_index,
+                    event.interface_number,
+                    event.endpoint_address,
+                    event.status,
+                    event.max_packet_size,
+                    event.interval
+                ),
                 _ => {}
             }
         }
@@ -392,7 +401,7 @@ fn main() -> ! {
         .copied()
         .find(|source| source.max_packet_size != 0)
         .expect("at least one HID source");
-    let profiles: [Option<RuntimeHidInterface<'_>>; MAX_HID_INTERFACES] =
+    let profiles: [Option<RuntimeHidInterface>; MAX_HID_INTERFACES] =
         core::array::from_fn(|index| {
             let source = sources[index];
             let descriptor_len = report_descriptor_lens[index];
@@ -412,8 +421,14 @@ fn main() -> ! {
                 interval,
                 source.interface_protocol
             );
+            /* `main` never returns and this storage is not modified after the
+             * profile phase, so the descriptor remains valid for every later
+             * EP0 request. RuntimeHidInterface requires this lifetime to use
+             * usb-device's zero-copy control-IN path for descriptors >256 B. */
+            let report_descriptor: &'static [u8] =
+                unsafe { core::mem::transmute(&report_descriptors[index][..descriptor_len]) };
             Some(RuntimeHidInterface {
-                report_descriptor: &report_descriptors[index][..descriptor_len],
+                report_descriptor,
                 max_packet_size: source.max_packet_size,
                 interval,
                 subclass: source.interface_subclass,
@@ -689,6 +704,14 @@ fn main() -> ! {
                         event.status
                     );
                 }
+                6 => rprintln!(
+                    "OTG2 HID[{}] endpoint={:#04x} attributes={:#04x} packet={} interval={}",
+                    event.interface_index,
+                    event.endpoint_address,
+                    event.status,
+                    event.max_packet_size,
+                    event.interval
+                ),
                 _ => {}
             }
         }

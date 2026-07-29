@@ -19,6 +19,7 @@ typedef struct
 {
     uint8_t occupied;
     uint8_t openStarted;
+    uint8_t openCallbackSeen;
     uint8_t speed;
     uint8_t address;
     uint8_t hubAddress;
@@ -234,6 +235,8 @@ static void HidInterfaceCallback(void *param, uint8_t *data, uint32_t dataLen, u
     (void)data;
     (void)dataLen;
 
+    slot->openCallbackSeen = 1U;
+
     if (status != kStatus_USB_Success)
     {
         nxp_host_event_t readyEvent = {0};
@@ -300,6 +303,7 @@ static void StartNextHidInterface(void)
             continue;
         }
         slot->openStarted = 1U;
+        slot->openCallbackSeen = 0U;
         s_openingSlot = slot;
         interface = (usb_host_interface_t *)slot->interfaceHandle;
         status = USB_HostHidInit(slot->deviceHandle, &slot->classHandle);
@@ -310,6 +314,13 @@ static void StartNextHidInterface(void)
                                              interface->interfaceDesc->bAlternateSetting,
                                              HidInterfaceCallback,
                                              slot);
+        }
+        /* Alternate setting zero invokes the callback synchronously, including
+         * on a pipe-open failure. The callback already advances the queue, so
+         * do not emit the same failure a second time here. */
+        if (slot->openCallbackSeen != 0U)
+        {
+            return;
         }
         if (status != kStatus_USB_Success)
         {
@@ -452,6 +463,19 @@ static usb_status_t HostEvent(usb_device_handle device,
                     event.kind = NXP_HOST_EVENT_HID_ATTACHED;
                     FillSlotEvent(&event, slot);
                     PushEvent(&event);
+                    for (endpointIndex = 0U; endpointIndex < interface->epCount; ++endpointIndex)
+                    {
+                        usb_descriptor_endpoint_t *ep = interface->epList[endpointIndex].epDesc;
+                        nxp_host_event_t endpointEvent = {0};
+                        endpointEvent.kind = NXP_HOST_EVENT_ENDPOINT;
+                        endpointEvent.status = ep->bmAttributes;
+                        FillSlotEvent(&endpointEvent, slot);
+                        endpointEvent.endpointAddress = ep->bEndpointAddress;
+                        endpointEvent.interval = ep->bInterval;
+                        endpointEvent.maxPacketSize =
+                            USB_SHORT_FROM_LITTLE_ENDIAN_ADDRESS(ep->wMaxPacketSize);
+                        PushEvent(&endpointEvent);
+                    }
                 }
                 StartNextHidInterface();
             }

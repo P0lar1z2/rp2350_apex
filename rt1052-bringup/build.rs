@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -16,6 +17,69 @@ fn run(mut command: Command, description: &str) {
         .status()
         .unwrap_or_else(|error| panic!("failed to run {description}: {error}"));
     assert!(status.success(), "{description} failed with {status}");
+}
+
+fn stage_rt1052_ehci(source: &Path, out: &Path) -> PathBuf {
+    let mut contents = fs::read_to_string(source)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", source.display()));
+    let repeated_interrupt_charge = r#"                else /* iso bandwidth is allocated three times */
+                {
+                    frameBandwidths[ehciPipePointer->startUframe + 1U] += ehciPipePointer->dataTime;
+                    frameBandwidths[ehciPipePointer->startUframe + 2U] += ehciPipePointer->dataTime;
+                    frameBandwidths[ehciPipePointer->startUframe + 3U] += ehciPipePointer->dataTime;
+                }"#;
+    let single_interrupt_charge = r#"                else /* interrupt payload occupies the TT once; complete-split retries are accounted separately */
+                {
+                    frameBandwidths[ehciPipePointer->startUframe + 1U] += ehciPipePointer->dataTime;
+                }"#;
+    assert_eq!(
+        contents.matches(repeated_interrupt_charge).count(),
+        1,
+        "NXP EHCI interrupt bandwidth accounting changed upstream"
+    );
+    contents = contents.replacen(repeated_interrupt_charge, single_interrupt_charge, 1);
+
+    let repeated_candidate_charge = r#"                    index = (uint8_t)(uframeIntervalIndex + 1U);
+                    for (; index <= (uframeIntervalIndex + 3U); ++index) /* data bandwidth number is 3.
+                                                                             uframeIntervalIndex don't exceed 4, so
+                                                                             index cannot exceed 7 */
+                    {
+                        if (frameTimes[index] + timeData > s_SlotMaxBandwidth[index])
+                        {
+                            allocateOk = 0;
+                            break;
+                        }
+                    }"#;
+    let single_candidate_charge = r#"                    index = (uint8_t)(uframeIntervalIndex + 1U);
+                    frameTimes[index] += (uint16_t)timeData;
+                    for (; index < 7U; ++index)
+                    {
+                        if (frameTimes[index] > s_SlotMaxBandwidth[index])
+                        {
+                            frameTimes[index + 1U] +=
+                                (uint16_t)(frameTimes[index] - s_SlotMaxBandwidth[index]);
+                            frameTimes[index] = s_SlotMaxBandwidth[index];
+                        }
+                        else
+                        {
+                            break;
+                        }
+                    }
+                    if (frameTimes[index] > s_SlotMaxBandwidth[index])
+                    {
+                        allocateOk = 0U;
+                    }"#;
+    assert_eq!(
+        contents.matches(repeated_candidate_charge).count(),
+        1,
+        "NXP EHCI interrupt candidate accounting changed upstream"
+    );
+    contents = contents.replacen(repeated_candidate_charge, single_candidate_charge, 1);
+
+    let staged = out.join("usb_host_ehci_rt1052.c");
+    fs::write(&staged, contents)
+        .unwrap_or_else(|error| panic!("failed to write {}: {error}", staged.display()));
+    staged
 }
 
 fn compile_nxp_host(manifest: &Path) {
@@ -42,6 +106,8 @@ fn compile_nxp_host(manifest: &Path) {
         usb.join("host/class"),
         usb.join("phy"),
     ];
+    let ehci_source = usb.join("host/usb_host_ehci.c");
+    let staged_ehci = stage_rt1052_ehci(&ehci_source, &out);
     let sources = [
         manifest.join("csrc/osa_baremetal.c"),
         manifest.join("csrc/nxp_host_ffi.c"),
@@ -52,7 +118,7 @@ fn compile_nxp_host(manifest: &Path) {
         usb.join("host/usb_host_hci.c"),
         usb.join("host/usb_host_devices.c"),
         usb.join("host/usb_host_framework.c"),
-        usb.join("host/usb_host_ehci.c"),
+        staged_ehci,
         usb.join("host/class/usb_host_hub.c"),
         usb.join("host/class/usb_host_hub_app.c"),
         usb.join("host/class/usb_host_hid.c"),
@@ -109,6 +175,7 @@ fn compile_nxp_host(manifest: &Path) {
     ] {
         println!("cargo:rerun-if-changed={}", manifest.join(source).display());
     }
+    println!("cargo:rerun-if-changed={}", ehci_source.display());
 }
 
 fn compile_nxp_enet(manifest: &Path) {

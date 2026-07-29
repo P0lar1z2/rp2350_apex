@@ -21,26 +21,26 @@ pub const MAX_REPORT_DESCRIPTOR: usize = 512;
 pub const MAX_HID_INTERFACES: usize = 6;
 
 #[derive(Clone, Copy)]
-pub struct RuntimeHidInterface<'a> {
-    pub report_descriptor: &'a [u8],
+pub struct RuntimeHidInterface {
+    pub report_descriptor: &'static [u8],
     pub max_packet_size: u16,
     pub interval: u8,
     pub subclass: u8,
     pub protocol: u8,
 }
 
-pub struct RuntimeCompositeHid<'usb, 'profile, B: UsbBus> {
+pub struct RuntimeCompositeHid<'usb, B: UsbBus> {
     interfaces: [Option<InterfaceNumber>; MAX_HID_INTERFACES],
     interrupt_in: [Option<EndpointIn<'usb, B>>; MAX_HID_INTERFACES],
-    profiles: [Option<RuntimeHidInterface<'profile>>; MAX_HID_INTERFACES],
+    profiles: [Option<RuntimeHidInterface>; MAX_HID_INTERFACES],
     selected_protocol: [u8; MAX_HID_INTERFACES],
     idle: [u8; MAX_HID_INTERFACES],
 }
 
-impl<'usb, 'profile, B: UsbBus> RuntimeCompositeHid<'usb, 'profile, B> {
+impl<'usb, B: UsbBus> RuntimeCompositeHid<'usb, B> {
     pub fn new(
         alloc: &'usb UsbBusAllocator<B>,
-        profiles: [Option<RuntimeHidInterface<'profile>>; MAX_HID_INTERFACES],
+        profiles: [Option<RuntimeHidInterface>; MAX_HID_INTERFACES],
     ) -> Self {
         let interfaces = core::array::from_fn(|index| profiles[index].map(|_| alloc.interface()));
         let interrupt_in = core::array::from_fn(|index| {
@@ -75,7 +75,7 @@ impl<'usb, 'profile, B: UsbBus> RuntimeCompositeHid<'usb, 'profile, B> {
     }
 }
 
-impl<B: UsbBus> UsbClass<B> for RuntimeCompositeHid<'_, '_, B> {
+impl<B: UsbBus> UsbClass<B> for RuntimeCompositeHid<'_, B> {
     fn reset(&mut self) {
         self.selected_protocol.fill(1);
         self.idle.fill(0);
@@ -124,7 +124,11 @@ impl<B: UsbBus> UsbClass<B> for RuntimeCompositeHid<'_, '_, B> {
             && req.request == 0x06
             && (req.value >> 8) as u8 == DESCRIPTOR_REPORT
         {
-            let _ = xfer.accept_with(profile.report_descriptor);
+            /* Report descriptors can exceed usb-device's 256-byte copied
+             * control buffer. They live for the firmware lifetime, so stream
+             * them directly through EP0 instead of returning BufferOverflow
+             * and stalling the host request. */
+            let _ = xfer.accept_with_static(profile.report_descriptor);
             return;
         }
         if req.request_type != RequestType::Class {
