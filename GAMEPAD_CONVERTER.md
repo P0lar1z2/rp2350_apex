@@ -80,3 +80,11 @@
 - Force Feedback / rumble、LED、电量和音频端点。
 - 宏、Turbo、压枪曲线、武器识别、屏幕识别或网络控制自动化。
 - 游戏反作弊绕过、设备指纹伪装或隐藏物理输入来源。
+
+## 2026-08-02 实机记录
+
+- RAM 运行与 FlexSPI 启动均在 Linux 上枚举为 `cafe:1052 xense RT1052 KBM Gamepad`，Full-Speed、单 HID 接口、13 字节 Interrupt IN、`bInterval=1`。
+- Linux `usbhid` 成功绑定，并创建 `event2` 与 `js0`；输入子系统标记为 joystick。
+- 烧写前生成新的 32 MiB W25Q256 备份，SHA-256 为 `59000e4e3daad2fb5401e8727c034468763bcab82feb1651246f8f2b8833579f`。
+- 烧写镜像为 84,000 字节，擦除两个 64 KiB 扇区；镜像和独立回读 SHA-256 均为 `d007a929f3ceeb2e8b2758502d77f8ff2d78f34e48efcd5af52957cf55d233b0`。
+- 本次 OTG2 枚举中 Razer `1532:00b8` 的接口 0/1 可用；Dell `413c:2113` 的接口接收器/描述符初始化失败，因此转换器退选 Razer 接口 1 作为键盘来源。需要手动验证实际 WASD 来源，并继续修复独立键盘枚举稳定性。

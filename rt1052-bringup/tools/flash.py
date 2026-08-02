@@ -32,7 +32,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CRATE_DIR = SCRIPT_DIR.parent
 REPO_DIR = CRATE_DIR.parent
 ARTIFACT_DIR = CRATE_DIR / ".flash"
-ELF_PATH = CRATE_DIR / "target/thumbv7em-none-eabihf/release/hid_bridge"
+SUPPORTED_BINARIES = ("hid_bridge", "gamepad_bridge")
 
 
 def run(command: list[str]) -> None:
@@ -182,11 +182,12 @@ def build_image(args: argparse.Namespace, backup_path: Path) -> Path:
             "--features",
             "nxp-host,nxp-device,flash-xip",
             "--bin",
-            "hid_bridge",
+            args.binary,
         ]
     )
-    app = elf_flash_payload(ELF_PATH)
-    app_path = ARTIFACT_DIR / "hid_bridge-xip-app.bin"
+    elf_path = CRATE_DIR / f"target/thumbv7em-none-eabihf/release/{args.binary}"
+    app = elf_flash_payload(elf_path)
+    app_path = ARTIFACT_DIR / f"{args.binary}-xip-app.bin"
     app_path.write_bytes(app)
     if len(app) < 8:
         raise SystemExit("XIP application binary is missing its vector table")
@@ -203,7 +204,7 @@ def build_image(args: argparse.Namespace, backup_path: Path) -> Path:
     struct.pack_into("<I", header, 0x1020, FLASH_BASE)
     struct.pack_into("<I", header, 0x1024, FLASH_SIZE)
 
-    image_path = ARTIFACT_DIR / "hid_bridge-rt1052-boot.bin"
+    image_path = ARTIFACT_DIR / f"{args.binary}-rt1052-boot.bin"
     image_path.write_bytes(header + app)
     if image_path.stat().st_size > 8 * 1024 * 1024:
         raise SystemExit("image exceeds pyOCD's 8 MiB quad-SPI programming region")
@@ -219,7 +220,7 @@ def build_image(args: argparse.Namespace, backup_path: Path) -> Path:
         "initial_sp": f"0x{initial_sp:08x}",
         "reset_vector": f"0x{reset:08x}",
     }
-    (ARTIFACT_DIR / "hid_bridge-rt1052-boot.json").write_text(
+    (ARTIFACT_DIR / f"{args.binary}-rt1052-boot.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
     )
     print(json.dumps(manifest, indent=2))
@@ -229,7 +230,7 @@ def build_image(args: argparse.Namespace, backup_path: Path) -> Path:
 def verify_image(args: argparse.Namespace, image_path: Path) -> None:
     if not image_path.is_file():
         raise SystemExit(f"image not found: {image_path}")
-    verify_path = ARTIFACT_DIR / "hid_bridge-rt1052-readback.bin"
+    verify_path = ARTIFACT_DIR / f"{args.binary}-rt1052-readback.bin"
     command = connection_args(args, "commander", "10k") + [
         "-M",
         "under-reset",
@@ -290,6 +291,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--probe", help="CMSIS-DAP serial (or set PYOCD_PROBE)", default=os.getenv("PYOCD_PROBE"))
     result.add_argument("--read-frequency", default="10m", help="SWD rate for backup/verify")
     result.add_argument("--program-frequency", default="50k", help="SWD rate for programming")
+    result.add_argument(
+        "--bin",
+        dest="binary",
+        choices=SUPPORTED_BINARIES,
+        default="hid_bridge",
+        help="firmware binary to build and flash (default: hid_bridge)",
+    )
     sub = result.add_subparsers(dest="command", required=True)
     backup_parser = sub.add_parser("backup", help="read and validate the entire 32 MiB Flash")
     backup_parser.add_argument("--output")

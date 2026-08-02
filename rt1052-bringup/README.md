@@ -92,14 +92,18 @@ python3 -m venv .venv-pyocd
 # Destructive step: backup again, erase only occupied sectors, program, verify.
 ./tools/flash.py flash --yes
 
+# Build/flash the fixed HID gamepad converter instead of the HID clone.
+# Global options must appear before the subcommand.
+./tools/flash.py --bin gamepad_bridge flash --yes
+
 # Retry readback/boot only after a transient DAP reconnect failure.
 ./tools/flash.py verify .flash/hid_bridge-rt1052-boot.bin
 ```
 
-The generated image is `.flash/hid_bridge-rt1052-boot.bin`. Without `--yes`,
-the `flash` command stops after backup and image creation. Keep at least one
-full backup outside the repository before programming. The workflow does not
-burn eFuses and does not perform a whole-chip erase.
+The generated image is `.flash/<binary>-rt1052-boot.bin`. Without `--yes`, the
+`flash` command stops after backup and image creation. Keep at least one full
+backup outside the repository before programming. The workflow does not burn
+eFuses and does not perform a whole-chip erase.
 
 Hardware verification programmed 108,576 image bytes after erasing two 64 KiB
 sectors. The complete programmed range matched its SHA-256 readback, then an
