@@ -93,6 +93,7 @@ pub enum Step {
 pub struct Program {
     pub trigger: Trigger,
     pub repeat: Repeat,
+    pub startup_steps: Option<&'static [Step]>,
     pub steps: &'static [Step],
     pub alternate_steps: Option<&'static [Step]>,
     pub alternate_on_repeat: bool,
@@ -220,9 +221,16 @@ impl ProgramState {
         self.waiting = false;
         self.owned_buttons = 0;
         self.owned_keyboard = KeyboardState::empty();
-        self.depth = 1;
         let steps = self.next_steps(program);
         self.frames[0] = Frame::new(steps, program.repeat);
+        if let Some(startup_steps) = program.startup_steps {
+            // Frames execute from deepest to shallowest, so a one-shot startup
+            // frame runs before the normal repeating program at frame zero.
+            self.frames[1] = Frame::new(startup_steps, Repeat::Once);
+            self.depth = 2;
+        } else {
+            self.depth = 1;
+        }
     }
 
     fn next_steps(&mut self, program: &Program) -> &'static [Step] {
@@ -422,14 +430,23 @@ impl MacroEngine {
     }
 
     pub fn has_keyboard_output(&self) -> bool {
-        self.effective_keyboard(self.current_mask()) != self.last_queued_keyboard
+        self.keyboard_output() != self.last_queued_keyboard
+    }
+
+    /// Return the complete keyboard state that must be presented upstream.
+    ///
+    /// Bridges with separate physical source and presentation interfaces use
+    /// this snapshot to keep unrelated target-interface reports from briefly
+    /// releasing held physical or synthetic keys.
+    pub fn keyboard_output(&self) -> KeyboardState {
+        self.effective_keyboard(self.current_mask())
     }
 
     pub fn take_keyboard_output(&mut self) -> Option<KeyboardState> {
         if !self.has_keyboard_output() {
             return None;
         }
-        let state = self.effective_keyboard(self.current_mask());
+        let state = self.keyboard_output();
         self.last_queued_keyboard = state;
         Some(state)
     }
@@ -704,7 +721,10 @@ fn clamp_i8(value: i16) -> i8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::usb_host::MouseState;
+    use crate::{
+        macro_config::CONFIG as SHARED_CONFIG,
+        usb_host::{KeyboardState, MouseState, parse_report_descriptor},
+    };
 
     const SIDE5: &[Input] = &[Input::MouseButton(5)];
     const RAPID_STEPS: &[Step] = &[
@@ -720,6 +740,7 @@ mod tests {
             mask: Mask::Chord,
         },
         repeat: Repeat::WhileActive,
+        startup_steps: None,
         steps: RAPID_STEPS,
         alternate_steps: None,
         alternate_on_repeat: false,
@@ -748,6 +769,7 @@ mod tests {
             mask: Mask::Chord,
         },
         repeat: Repeat::Once,
+        startup_steps: None,
         steps: &[Step::Repeat {
             repeat: Repeat::Count(RandomU16::Fixed(3)),
             steps: MOVE_LOOP,
@@ -786,6 +808,279 @@ mod tests {
             wheel: 0,
             pan: 0,
         })
+    }
+
+    const DELL_KEYBOARD_DESCRIPTOR: &[u8] = &[
+        0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0x00, 0x25,
+        0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x95, 0x03,
+        0x75, 0x01, 0x05, 0x08, 0x19, 0x01, 0x29, 0x03, 0x91, 0x02, 0x95, 0x01, 0x75, 0x05, 0x91,
+        0x01, 0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x26, 0xff, 0x00, 0x05, 0x07, 0x19, 0x00, 0x2a,
+        0xff, 0x00, 0x81, 0x00, 0xc0,
+    ];
+    const RAZER_BOOT_KEYBOARD_DESCRIPTOR: &[u8] = &[
+        0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0x00, 0x25,
+        0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x81, 0x01, 0x19, 0x00, 0x2a, 0xff, 0x00, 0x15,
+        0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x06, 0x81, 0x00, 0x05, 0x08, 0x19, 0x01, 0x29,
+        0x03, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x03, 0x91, 0x02, 0x95, 0x05, 0x91, 0x01,
+        0xc0,
+    ];
+    const RAZER_MOUSE_DESCRIPTOR: &[u8] = &[
+        0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29,
+        0x05, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x05, 0x81, 0x02, 0x75, 0x01, 0x95, 0x0b,
+        0x81, 0x03, 0x05, 0x0c, 0x0a, 0x38, 0x02, 0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x01,
+        0x81, 0x06, 0x05, 0x01, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x01, 0x81,
+        0x06, 0x09, 0x30, 0x09, 0x31, 0x16, 0x00, 0x80, 0x26, 0xff, 0x7f, 0x75, 0x10, 0x95, 0x02,
+        0x81, 0x06, 0xc0, 0x06, 0x00, 0xff, 0x09, 0x02, 0x15, 0x00, 0x25, 0x01, 0x75, 0x08, 0x95,
+        0x5a, 0xb1, 0x01, 0xc0,
+    ];
+
+    fn direction_mask(state: KeyboardState) -> u8 {
+        u8::from(state.is_pressed(0x04))
+            | (u8::from(state.is_pressed(0x1a)) << 1)
+            | (u8::from(state.is_pressed(0x07)) << 2)
+            | (u8::from(state.is_pressed(0x16)) << 3)
+    }
+
+    fn exercise_captured_rt1052_path(trigger_usage: u8) -> (u16, bool, bool, bool) {
+        let source = parse_report_descriptor(DELL_KEYBOARD_DESCRIPTOR);
+        let keyboard_target = parse_report_descriptor(RAZER_BOOT_KEYBOARD_DESCRIPTOR);
+        let mouse_target = parse_report_descriptor(RAZER_MOUSE_DESCRIPTOR);
+        let mut keyboard_template = [0u8; 64];
+        let keyboard_len = keyboard_target
+            .encode_new(
+                &DecodedReport::Keyboard(KeyboardState::empty()),
+                &mut keyboard_template,
+            )
+            .unwrap();
+        let mut mouse_template = [0u8; 64];
+        let mouse_len = mouse_target
+            .encode_new(&mouse(0), &mut mouse_template)
+            .unwrap();
+        assert_eq!(keyboard_len, 8);
+        assert_eq!(mouse_len, 8);
+
+        let mut engine = MacroEngine::new(&SHARED_CONFIG, 0x1052);
+        let trigger = source
+            .decode(&[0x02, 0, trigger_usage, 0, 0, 0, 0, 0])
+            .unwrap();
+        engine.observe(trigger);
+
+        let mut seen_directions = 0u16;
+        let mut saw_ctrl = false;
+        let mut saw_wheel_up = false;
+        let mut saw_wheel_down = false;
+        for millisecond in 0..1_200u32 {
+            engine.tick(millisecond * 1_000);
+            if let Some(state) = engine.take_keyboard_output() {
+                let mut report = keyboard_template;
+                keyboard_target
+                    .encode(&DecodedReport::Keyboard(state), &mut report[..keyboard_len])
+                    .unwrap();
+                assert_eq!(
+                    keyboard_target.decode(&report[..keyboard_len]),
+                    Some(DecodedReport::Keyboard(state))
+                );
+                assert_eq!(state.modifiers & 0x02, 0, "left Shift must stay masked");
+                seen_directions |= 1 << direction_mask(state);
+                saw_ctrl |= state.modifiers & 0x01 != 0;
+            }
+            if let Some(generated) = engine.take_mouse_output() {
+                let state = MouseState {
+                    buttons: generated.buttons,
+                    x: generated.x,
+                    y: generated.y,
+                    wheel: generated.wheel,
+                    pan: generated.pan,
+                };
+                let mut report = mouse_template;
+                mouse_target
+                    .encode(&DecodedReport::Mouse(state), &mut report[..mouse_len])
+                    .unwrap();
+                assert_eq!(
+                    mouse_target.decode(&report[..mouse_len]),
+                    Some(DecodedReport::Mouse(state))
+                );
+                saw_wheel_up |= state.wheel > 0;
+                saw_wheel_down |= state.wheel < 0;
+            }
+        }
+
+        let released = source.decode(&[0; 8]).unwrap();
+        engine.observe(released);
+        engine.tick(1_201_000);
+        assert_eq!(engine.take_keyboard_output(), Some(KeyboardState::empty()));
+        (seen_directions, saw_ctrl, saw_wheel_up, saw_wheel_down)
+    }
+
+    #[test]
+    fn captured_rt1052_left_bunny_hop_round_trips_expected_outputs() {
+        let (seen, ctrl, wheel_up, wheel_down) = exercise_captured_rt1052_path(0x1a);
+        for directions in [0b0000, 0b0001, 0b0010, 0b0011] {
+            assert_ne!(
+                seen & (1 << directions),
+                0,
+                "missing direction state {directions:04b}"
+            );
+        }
+        assert!(ctrl);
+        assert!(wheel_down && wheel_up);
+        assert_eq!(
+            seen & 0xfff0,
+            0,
+            "D/S must not appear in the isolation preset"
+        );
+    }
+
+    #[test]
+    fn lurch_startup_preserves_the_held_forward_run() {
+        let source = parse_report_descriptor(DELL_KEYBOARD_DESCRIPTOR);
+        let mut engine = MacroEngine::new(&SHARED_CONFIG, 0x1052);
+        let running = source.decode(&[0, 0, 0x1a, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(engine.observe(running), running);
+
+        let trigger = source.decode(&[0x02, 0, 0x1a, 0, 0, 0, 0, 0]).unwrap();
+        engine.observe(trigger);
+        engine.tick(1_000);
+        let startup = engine.keyboard_output();
+        assert!(startup.is_pressed(0x1a), "W must remain held at startup");
+        assert_ne!(startup.modifiers & 0x01, 0, "Ctrl must start the slide");
+        assert_eq!(startup.modifiers & 0x02, 0, "Shift must remain masked");
+        assert!(!startup.is_pressed(0x04));
+        assert!(!startup.is_pressed(0x07));
+        assert!(!startup.is_pressed(0x16));
+    }
+
+    #[test]
+    fn lurch_holds_left_then_bunny_hops_without_directions() {
+        let source = parse_report_descriptor(DELL_KEYBOARD_DESCRIPTOR);
+        let trigger = source.decode(&[0x02, 0, 0x1a, 0, 0, 0, 0, 0]).unwrap();
+        let mut engine = MacroEngine::new(&SHARED_CONFIG, 0x1052);
+        engine.observe(trigger);
+
+        let mut burst_starts = [0u32; 8];
+        let mut burst_count = 0usize;
+        let mut last_wheel_down = None;
+        let mut first_a_at = None;
+        let mut last_a_at = None;
+        let mut saw_wa = false;
+        let mut saw_a_only = false;
+        let mut forward_wheel_count = 0usize;
+        for millisecond in 0..4_000u32 {
+            engine.tick(millisecond * 1_000);
+            let keyboard = engine.keyboard_output();
+            if keyboard.is_pressed(0x04) {
+                if first_a_at.is_none() {
+                    first_a_at = Some(millisecond);
+                }
+                last_a_at = Some(millisecond);
+                saw_wa |= keyboard.is_pressed(0x1a);
+                saw_a_only |= !keyboard.is_pressed(0x1a);
+            }
+            if let Some(output) = engine.take_mouse_output() {
+                if output.wheel > 0 {
+                    assert!(
+                        keyboard.is_pressed(0x04),
+                        "wheel-forward must only run while A is held"
+                    );
+                    forward_wheel_count += 1;
+                } else if output.wheel < 0 {
+                    if last_wheel_down.is_none_or(|last| millisecond > last + 1) {
+                        assert_ne!(keyboard.modifiers & 0x01, 0, "Ctrl must be held");
+                        assert!(!keyboard.is_pressed(0x04), "A is pressed after takeoff");
+                        assert_eq!(keyboard.is_pressed(0x1a), burst_count == 0);
+                        assert!(!keyboard.is_pressed(0x07), "D must never be pressed");
+                        assert!(!keyboard.is_pressed(0x16), "S must never be pressed");
+                        if burst_count < burst_starts.len() {
+                            burst_starts[burst_count] = millisecond;
+                        }
+                        burst_count += 1;
+                    }
+                    last_wheel_down = Some(millisecond);
+                }
+            }
+        }
+
+        assert!(burst_count >= 5, "expected repeated boundary bunny-hops");
+        assert!(
+            (118..=122).contains(&burst_starts[0]),
+            "initial slide-jump started at {} ms instead of after the startup slide",
+            burst_starts[0]
+        );
+        for pair in burst_starts[..burst_count.min(burst_starts.len())].windows(2) {
+            let interval = pair[1] - pair[0];
+            assert!(
+                (678..=682).contains(&interval),
+                "landing bunny-hop interval {interval} ms is outside the expected cadence"
+            );
+        }
+        let first_a_at = first_a_at.expect("expected a left lurch impulse");
+        assert!(
+            first_a_at > burst_starts[0] && first_a_at - burst_starts[0] < 400,
+            "A must be pressed after takeoff and inside the 400 ms lurch window"
+        );
+        let last_a_at = last_a_at.expect("expected the left input to be held");
+        assert!(
+            (198..=202).contains(&(last_a_at - first_a_at)),
+            "A hold must remain close to the configured human-scale 200 ms"
+        );
+        assert!(saw_wa, "the transition must contain a W+A overlap");
+        assert!(saw_a_only, "A must remain after W is released");
+        assert!(
+            (195..=205).contains(&forward_wheel_count),
+            "wheel-forward must cover the full 200 ms A hold"
+        );
+
+        engine.tick(4_001_000);
+        let keyboard = engine.keyboard_output();
+        assert_ne!(keyboard.modifiers & 0x01, 0);
+        for usage in [0x04, 0x07, 0x16, 0x1a] {
+            assert!(
+                !keyboard.is_pressed(usage),
+                "direction key {usage:#04x} held"
+            );
+        }
+    }
+
+    #[test]
+    fn captured_rt1052_neo_strafe_round_trips_expected_outputs() {
+        let (seen, ctrl, wheel_up, wheel_down) = exercise_captured_rt1052_path(0x16);
+        for directions in [0b0100, 0b0110, 0b0111, 0b0001, 0b1001, 0b1101, 0b1100] {
+            assert_ne!(
+                seen & (1 << directions),
+                0,
+                "missing direction state {directions:04b}"
+            );
+        }
+        assert!(ctrl);
+        assert!(wheel_up && wheel_down);
+    }
+
+    #[test]
+    fn keyboard_snapshot_keeps_held_macro_keys_across_target_idle_reports() {
+        let source = parse_report_descriptor(DELL_KEYBOARD_DESCRIPTOR);
+        let target = parse_report_descriptor(RAZER_BOOT_KEYBOARD_DESCRIPTOR);
+        let trigger = source.decode(&[0x02, 0, 0x1a, 0, 0, 0, 0, 0]).unwrap();
+        let mut engine = MacroEngine::new(&SHARED_CONFIG, 0x1052);
+        engine.observe(trigger);
+        engine.tick(0);
+        let held = engine.take_keyboard_output().unwrap();
+        assert!(held.is_pressed(0x1a));
+        assert_ne!(held.modifiers & 0x01, 0);
+        assert!(!engine.has_keyboard_output());
+
+        let mut target_idle_report = [0u8; 8];
+        assert_eq!(
+            target.decode(&target_idle_report),
+            Some(DecodedReport::Keyboard(KeyboardState::empty()))
+        );
+        let snapshot = engine.keyboard_output();
+        target
+            .encode(&DecodedReport::Keyboard(snapshot), &mut target_idle_report)
+            .unwrap();
+        assert_eq!(
+            target.decode(&target_idle_report),
+            Some(DecodedReport::Keyboard(held))
+        );
     }
 
     #[test]
@@ -853,6 +1148,7 @@ mod tests {
                         mask: Mask::None,
                     },
                     repeat: Repeat::Once,
+                    startup_steps: None,
                     steps: &[Step::MouseMove {
                         x: RandomI16::Fixed(-2),
                         y: RandomI16::Fixed(0),
@@ -891,6 +1187,7 @@ mod tests {
                         mask: Mask::None,
                     },
                     repeat: Repeat::WhileActive,
+                    startup_steps: None,
                     steps: &[
                         Step::KeyDown(0xe0),
                         Step::KeyDown(0x1a),
@@ -929,6 +1226,7 @@ mod tests {
                         mask: Mask::None,
                     },
                     repeat: Repeat::WhileActive,
+                    startup_steps: None,
                     steps: &[
                         Step::MouseMove {
                             x: RandomI16::Fixed(-2),
@@ -973,6 +1271,7 @@ mod tests {
                         mask: Mask::None,
                     },
                     repeat: Repeat::Once,
+                    startup_steps: None,
                     steps: &[Step::Repeat {
                         repeat: Repeat::Count(RandomU16::Fixed(3)),
                         steps: &[
@@ -1014,6 +1313,7 @@ mod tests {
                         mask: Mask::None,
                     },
                     repeat: Repeat::Once,
+                    startup_steps: None,
                     steps: &[Step::Repeat {
                         repeat: Repeat::Count(RandomU16::Uniform { min: 2, max: 4 }),
                         steps: &[
@@ -1060,6 +1360,7 @@ mod tests {
                         mask: Mask::Inputs(&[Input::Key(0x1a)]),
                     },
                     repeat: Repeat::Once,
+                    startup_steps: None,
                     steps: &[Step::MouseMove {
                         x: RandomI16::Fixed(1),
                         y: RandomI16::Fixed(0),

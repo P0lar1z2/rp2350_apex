@@ -67,64 +67,46 @@ chord = ["mouse.right", "mouse.left"]
 behavior = "hold"
 mask = "none"
 
-# Always-on lurch strafe. Holding Shift+W continuously replays it, alternating
-# left-to-right and right-to-left on every pass. Both trigger keys are consumed.
+# Stage-one lurch isolation test. Holding Shift+W performs one forward
+# slide-jump, makes A the final direction press inside the 400 ms post-jump
+# lurch window, releases every direction key, then continuously bunny-hops on
+# the resulting leftward momentum. No right/back input or wheel-up is generated.
 [[layers]]
 id = "lurch_strafe"
 group = "lurch_strafe"
 default = true
 
 [[layers.macros]]
-id = "alternating_lurch_strafe"
+id = "left_bunny_hop_isolation"
 repeat = "while_active"
-alternate_on_repeat = true
 
-# Left to right. A is established before jump; every subsequent direction-down
-# lands inside the 400 ms lurch window. Wheel-down is jump and wheel-up is the
-# stacked forward input.
-sequence = [
-  { do = "keyboard.key_down", key = "key.a" },
-  { do = "wait", ms = { min = 16, max = 24 } },
-  { do = "mouse.wheel_burst", vertical = -1, duration_ms = { min = 30, max = 34 } },
-  { do = "wait", ms = { min = 45, max = 55 } },
+# One-time launch and left turn. Fixed timings make the video trace unambiguous:
+# Ctrl+W prepares the slide for 120 ms and jumps. The 80 ms wheel burst spans
+# multiple game frames. At 120 ms after jump onset A is pressed while W remains
+# held, producing 100 ms of W+A with continuous wheel-forward. W is then
+# released while A and wheel-forward remain active for another 100 ms. A is the
+# final direction press and is released 320 ms after jump onset, still inside
+# the 400 ms lurch window. The remaining 360 ms reaches the next landing
+# direction-free.
+startup_sequence = [
+  { do = "keyboard.key_down", key = "key.left_ctrl" },
   { do = "keyboard.key_down", key = "key.w" },
-  { do = "wait", ms = { min = 65, max = 80 } },
-  { do = "keyboard.key_down", key = "key.d" },
-  { do = "wait", ms = { min = 12, max = 18 } },
+  { do = "wait", ms = 120 },
+  { do = "mouse.wheel_burst", vertical = -1, duration_ms = 80 },
+  { do = "wait", ms = 40 },
+  { do = "keyboard.key_down", key = "key.a" },
+  { do = "mouse.wheel_burst", vertical = 1, duration_ms = 100 },
   { do = "keyboard.key_up", key = "key.w" },
-  { do = "wait", ms = { min = 4, max = 8 } },
+  { do = "mouse.wheel_burst", vertical = 1, duration_ms = 100 },
   { do = "keyboard.key_up", key = "key.a" },
-  { do = "mouse.wheel_burst", vertical = 1, duration_ms = { min = 46, max = 50 } },
-  { do = "wait", ms = { min = 30, max = 42 } },
-  { do = "keyboard.key_down", key = "key.s" },
-  { do = "mouse.wheel_burst", vertical = 1, duration_ms = { min = 46, max = 50 } },
-  { do = "wait", ms = { min = 34, max = 50 } },
-  { do = "keyboard.key_up", key = "key.d" },
-  { do = "keyboard.key_up", key = "key.s" },
-  { do = "wait", ms = { min = 16, max = 24 } },
+  { do = "wait", ms = 360 },
 ]
 
-# Right to left is the exact A/D mirror of the sequence above.
-alternate_sequence = [
-  { do = "keyboard.key_down", key = "key.d" },
-  { do = "wait", ms = { min = 16, max = 24 } },
-  { do = "mouse.wheel_burst", vertical = -1, duration_ms = { min = 30, max = 34 } },
-  { do = "wait", ms = { min = 45, max = 55 } },
-  { do = "keyboard.key_down", key = "key.w" },
-  { do = "wait", ms = { min = 65, max = 80 } },
-  { do = "keyboard.key_down", key = "key.a" },
-  { do = "wait", ms = { min = 12, max = 18 } },
-  { do = "keyboard.key_up", key = "key.w" },
-  { do = "wait", ms = { min = 4, max = 8 } },
-  { do = "keyboard.key_up", key = "key.d" },
-  { do = "mouse.wheel_burst", vertical = 1, duration_ms = { min = 46, max = 50 } },
-  { do = "wait", ms = { min = 30, max = 42 } },
-  { do = "keyboard.key_down", key = "key.s" },
-  { do = "mouse.wheel_burst", vertical = 1, duration_ms = { min = 46, max = 50 } },
-  { do = "wait", ms = { min = 34, max = 50 } },
-  { do = "keyboard.key_up", key = "key.a" },
-  { do = "keyboard.key_up", key = "key.s" },
-  { do = "wait", ms = { min = 16, max = 24 } },
+# After the one-time left impulse, replay only a landing bunny-hop every 680 ms.
+# Ctrl remains held, but W/A/S/D all remain released.
+sequence = [
+  { do = "mouse.wheel_burst", vertical = -1, duration_ms = 80 },
+  { do = "wait", ms = 600 },
 ]
 
 [layers.macros.trigger]

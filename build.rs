@@ -60,6 +60,8 @@ struct ProgramConfig {
     trigger: TriggerConfig,
     #[serde(default)]
     repeat: RepeatConfig,
+    #[serde(default)]
+    startup_sequence: Option<Vec<StepConfig>>,
     sequence: Vec<StepConfig>,
     #[serde(default)]
     alternate_sequence: Option<Vec<StepConfig>>,
@@ -304,6 +306,19 @@ fn compile_macro_config(out: &std::path::Path) {
             );
             generated.push_str(" }, repeat: ");
             write_repeat(&mut generated, &program.repeat, &program.id);
+            generated.push_str(", startup_steps: ");
+            if let Some(startup) = &program.startup_sequence {
+                assert!(
+                    !startup.is_empty(),
+                    "macro {} has an empty startup_sequence",
+                    program.id
+                );
+                generated.push_str("Some(&[");
+                write_steps(&mut generated, startup, &program.id, 0);
+                generated.push_str("])");
+            } else {
+                generated.push_str("None");
+            }
             generated.push_str(", steps: &[");
             write_steps(&mut generated, &program.sequence, &program.id, 0);
             generated.push_str("], alternate_steps: ");

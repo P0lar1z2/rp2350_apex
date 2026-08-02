@@ -2,9 +2,11 @@
 
 use usb_device::{
     Result as UsbResult, UsbError,
+    bus::StringIndex,
     bus::{InterfaceNumber, UsbBus, UsbBusAllocator},
     class_prelude::{ControlIn, ControlOut, DescriptorWriter, EndpointIn, UsbClass},
     control::{Recipient, RequestType},
+    descriptor::lang_id::LangID,
 };
 
 const USB_CLASS_HID: u8 = 0x03;
@@ -19,6 +21,13 @@ const REQUEST_SET_PROTOCOL: u8 = 0x0b;
 
 pub const MAX_REPORT_DESCRIPTOR: usize = 512;
 pub const MAX_HID_INTERFACES: usize = 6;
+const MAX_CONTROL_REPORT: usize = 256;
+
+#[derive(Clone, Copy)]
+pub struct HidReportProxy {
+    pub get_report: fn(u8, u8, u8, &mut [u8]) -> Option<usize>,
+    pub set_report: fn(u8, u8, u8, &[u8]) -> bool,
+}
 
 #[derive(Clone, Copy)]
 pub struct RuntimeHidInterface {
@@ -27,36 +36,52 @@ pub struct RuntimeHidInterface {
     pub interval: u8,
     pub subclass: u8,
     pub protocol: u8,
+    pub hid_version: u16,
+    pub country_code: u8,
+    pub interface_string: Option<&'static str>,
+    pub language_id: LangID,
 }
 
 pub struct RuntimeCompositeHid<'usb, B: UsbBus> {
     interfaces: [Option<InterfaceNumber>; MAX_HID_INTERFACES],
+    interface_strings: [Option<StringIndex>; MAX_HID_INTERFACES],
     interrupt_in: [Option<EndpointIn<'usb, B>>; MAX_HID_INTERFACES],
     profiles: [Option<RuntimeHidInterface>; MAX_HID_INTERFACES],
     selected_protocol: [u8; MAX_HID_INTERFACES],
     idle: [u8; MAX_HID_INTERFACES],
+    downstream_interfaces: [Option<u8>; MAX_HID_INTERFACES],
+    report_proxy: Option<HidReportProxy>,
 }
 
 impl<'usb, B: UsbBus> RuntimeCompositeHid<'usb, B> {
     pub fn new(
         alloc: &'usb UsbBusAllocator<B>,
         profiles: [Option<RuntimeHidInterface>; MAX_HID_INTERFACES],
+        report_proxy: Option<HidReportProxy>,
     ) -> Self {
         let interfaces = core::array::from_fn(|index| profiles[index].map(|_| alloc.interface()));
+        let interface_strings = core::array::from_fn(|index| {
+            profiles[index].and_then(|profile| profile.interface_string.map(|_| alloc.string()))
+        });
         let interrupt_in = core::array::from_fn(|index| {
             profiles[index].map(|profile| {
                 alloc.interrupt(
                     profile.max_packet_size.clamp(1, 64),
-                    profile.interval.clamp(1, 16),
+                    profile.interval.max(1),
                 )
             })
         });
         Self {
             interfaces,
+            interface_strings,
             interrupt_in,
             profiles,
             selected_protocol: [1; MAX_HID_INTERFACES],
             idle: [0; MAX_HID_INTERFACES],
+            downstream_interfaces: core::array::from_fn(|index| {
+                profiles[index].map(|_| index as u8)
+            }),
+            report_proxy,
         }
     }
 
@@ -66,6 +91,12 @@ impl<'usb, B: UsbBus> RuntimeCompositeHid<'usb, B> {
             .and_then(Option::as_ref)
             .ok_or(UsbError::InvalidEndpoint)?
             .write(report)
+    }
+
+    pub fn set_downstream_interface(&mut self, source_index: usize, interface_index: Option<u8>) {
+        if source_index < MAX_HID_INTERFACES && self.profiles[source_index].is_some() {
+            self.downstream_interfaces[source_index] = interface_index;
+        }
     }
 
     fn slot_for_interface(&self, interface: u16) -> Option<usize> {
@@ -90,14 +121,21 @@ impl<B: UsbBus> UsbClass<B> for RuntimeCompositeHid<'_, B> {
             ) else {
                 continue;
             };
-            writer.interface(interface, USB_CLASS_HID, profile.subclass, profile.protocol)?;
+            writer.interface_alt(
+                interface,
+                0,
+                USB_CLASS_HID,
+                profile.subclass,
+                profile.protocol,
+                self.interface_strings[index],
+            )?;
             let descriptor_len = profile.report_descriptor.len() as u16;
             writer.write(
                 DESCRIPTOR_HID,
                 &[
-                    0x11,
-                    0x01,
-                    0x00,
+                    profile.hid_version as u8,
+                    (profile.hid_version >> 8) as u8,
+                    profile.country_code,
                     0x01,
                     DESCRIPTOR_REPORT,
                     descriptor_len as u8,
@@ -136,7 +174,22 @@ impl<B: UsbBus> UsbClass<B> for RuntimeCompositeHid<'_, B> {
         }
         match req.request {
             REQUEST_GET_REPORT => {
-                let _ = xfer.accept_with(&[]);
+                let (Some(proxy), Some(interface_index)) =
+                    (self.report_proxy, self.downstream_interfaces[index])
+                else {
+                    return;
+                };
+                let mut report = [0u8; MAX_CONTROL_REPORT];
+                let requested = usize::from(req.length).min(report.len());
+                let Some(length) = (proxy.get_report)(
+                    interface_index,
+                    req.value as u8,
+                    (req.value >> 8) as u8,
+                    &mut report[..requested],
+                ) else {
+                    return;
+                };
+                let _ = xfer.accept_with(&report[..length.min(requested)]);
             }
             REQUEST_GET_IDLE => {
                 let _ = xfer.accept_with(core::slice::from_ref(&self.idle[index]));
@@ -160,7 +213,21 @@ impl<B: UsbBus> UsbClass<B> for RuntimeCompositeHid<'_, B> {
             return;
         };
         match req.request {
-            REQUEST_SET_REPORT => {}
+            REQUEST_SET_REPORT => {
+                let (Some(proxy), Some(interface_index)) =
+                    (self.report_proxy, self.downstream_interfaces[index])
+                else {
+                    return;
+                };
+                if !(proxy.set_report)(
+                    interface_index,
+                    req.value as u8,
+                    (req.value >> 8) as u8,
+                    xfer.data(),
+                ) {
+                    return;
+                }
+            }
             REQUEST_SET_IDLE => self.idle[index] = (req.value >> 8) as u8,
             REQUEST_SET_PROTOCOL if profile.subclass != 0 => {
                 self.selected_protocol[index] = req.value as u8;
@@ -168,6 +235,17 @@ impl<B: UsbBus> UsbClass<B> for RuntimeCompositeHid<'_, B> {
             _ => return,
         }
         let _ = xfer.accept();
+    }
+
+    fn get_string(&self, string_index: StringIndex, language_id: LangID) -> Option<&str> {
+        let index = self
+            .interface_strings
+            .iter()
+            .position(|candidate| *candidate == Some(string_index))?;
+        let profile = self.profiles[index]?;
+        (profile.language_id == language_id)
+            .then_some(profile.interface_string)
+            .flatten()
     }
 }
 

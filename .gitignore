@@ -130,3 +130,6 @@ __pycache__/
 # Local RT1052 Flash backups and generated boot images.
 /rt1052-bringup/.flash/
 /rt1052-bringup/.venv-pyocd/
+
+# Local gameplay/input captures; never commit recorded video.
+*.mp4

@@ -4,6 +4,8 @@
 #include "usb_host_config.h"
 #include "usb.h"
 #include "usb_host.h"
+#include "usb_host_devices.h"
+#include "usb_host_framework.h"
 #include "usb_host_hid.h"
 #include "usb_phy.h"
 
@@ -13,7 +15,11 @@
 #define REPORT_DATA_CAPACITY (64U)
 #define HID_RX_BUFFER_SIZE (64U)
 #define HID_REPORT_DESCRIPTOR_CAPACITY (512U)
+#define STRING_DESCRIPTOR_CAPACITY (255U)
+#define HID_CONTROL_REPORT_CAPACITY (256U)
 #define MAX_HID_INTERFACES (6U)
+
+_Static_assert(sizeof(usb_descriptor_device_t) == 18U, "USB device descriptor ABI changed");
 
 typedef struct
 {
@@ -55,9 +61,71 @@ static nxp_host_report_t s_reports[REPORT_QUEUE_CAPACITY];
 static volatile uint8_t s_reportRead;
 static volatile uint8_t s_reportWrite;
 static uint32_t s_reportSequence;
+__attribute__((section(".usb_dma.hid_string"), aligned(32)))
+static uint8_t s_stringDescriptor[STRING_DESCRIPTOR_CAPACITY];
+static volatile uint8_t s_stringState;
+static volatile uint16_t s_stringLength;
+__attribute__((section(".usb_dma.hid_control"), aligned(32)))
+static uint8_t s_hidControlReport[HID_CONTROL_REPORT_CAPACITY];
+static volatile uint8_t s_hidControlDone;
+static volatile uint8_t s_hidControlStatus;
+static volatile uint16_t s_hidControlLength;
 
 static void HidReceiveCallback(void *param, uint8_t *data, uint32_t dataLen, usb_status_t status);
 static void StartNextHidInterface(void);
+
+static void HidControlCallback(void *param, uint8_t *data, uint32_t dataLen, usb_status_t status)
+{
+    (void)param;
+    (void)data;
+    if (dataLen > HID_CONTROL_REPORT_CAPACITY)
+    {
+        dataLen = HID_CONTROL_REPORT_CAPACITY;
+    }
+    s_hidControlLength = (uint16_t)dataLen;
+    s_hidControlStatus = (uint8_t)status;
+    s_hidControlDone = 1U;
+}
+
+static uint8_t WaitForHidControl(hid_slot_t *slot)
+{
+    uint32_t started = DWT->CYCCNT;
+    uint32_t timeoutCycles = SystemCoreClock * 2U;
+
+    while (s_hidControlDone == 0U)
+    {
+        USB_HostEhciTaskFunction(s_hostHandle);
+        if ((DWT->CYCCNT - started) >= timeoutCycles)
+        {
+            usb_host_hid_instance_t *instance = (usb_host_hid_instance_t *)slot->classHandle;
+            if ((instance != NULL) && (instance->controlTransfer != NULL))
+            {
+                (void)USB_HostCancelTransfer(instance->hostHandle,
+                                             instance->controlPipe,
+                                             instance->controlTransfer);
+            }
+            return 0U;
+        }
+    }
+    return (s_hidControlStatus == (uint8_t)kStatus_USB_Success) ? 1U : 0U;
+}
+
+static void StringDescriptorCallback(void *param, usb_host_transfer_t *transfer, usb_status_t status)
+{
+    usb_host_device_instance_t *deviceInstance = (usb_host_device_instance_t *)param;
+
+    if ((status == kStatus_USB_Success) && (transfer->transferSofar <= STRING_DESCRIPTOR_CAPACITY))
+    {
+        s_stringLength = (uint16_t)transfer->transferSofar;
+        s_stringState  = 2U;
+    }
+    else
+    {
+        s_stringLength = 0U;
+        s_stringState  = 3U;
+    }
+    (void)USB_HostFreeTransfer(deviceInstance->hostHandle, transfer);
+}
 
 static void PushEvent(const nxp_host_event_t *event)
 {
@@ -615,6 +683,220 @@ int32_t nxp_host_copy_report_descriptor(uint8_t interfaceIndex, uint8_t *buffer,
         buffer[index] = s_reportDescriptors[interfaceIndex][index];
     }
     return (int32_t)length;
+}
+
+int32_t nxp_host_copy_device_descriptor(uint8_t interfaceIndex, uint8_t *buffer, uint16_t capacity)
+{
+    hid_slot_t *slot;
+    usb_host_device_instance_t *deviceInstance;
+    uint16_t index;
+    const uint16_t length = (uint16_t)sizeof(usb_descriptor_device_t);
+
+    if ((interfaceIndex >= MAX_HID_INTERFACES) || (buffer == NULL) || (capacity < length))
+    {
+        return 0;
+    }
+    slot = &s_hidSlots[interfaceIndex];
+    deviceInstance = (usb_host_device_instance_t *)slot->deviceHandle;
+    if ((slot->occupied == 0U) || (deviceInstance == NULL) || (deviceInstance->deviceDescriptor == NULL))
+    {
+        return 0;
+    }
+    for (index = 0U; index < length; ++index)
+    {
+        buffer[index] = ((uint8_t *)deviceInstance->deviceDescriptor)[index];
+    }
+    return (int32_t)length;
+}
+
+int32_t nxp_host_copy_configuration_descriptor(uint8_t interfaceIndex, uint8_t *buffer, uint16_t capacity)
+{
+    hid_slot_t *slot;
+    usb_host_device_instance_t *deviceInstance;
+    uint16_t length;
+    uint16_t index;
+
+    if ((interfaceIndex >= MAX_HID_INTERFACES) || (buffer == NULL))
+    {
+        return 0;
+    }
+    slot = &s_hidSlots[interfaceIndex];
+    deviceInstance = (usb_host_device_instance_t *)slot->deviceHandle;
+    if ((slot->occupied == 0U) || (deviceInstance == NULL) ||
+        (deviceInstance->configurationDesc == NULL))
+    {
+        return 0;
+    }
+    length = deviceInstance->configurationLen;
+    if ((length == 0U) || (capacity < length))
+    {
+        return 0;
+    }
+    for (index = 0U; index < length; ++index)
+    {
+        buffer[index] = deviceInstance->configurationDesc[index];
+    }
+    return (int32_t)length;
+}
+
+int32_t nxp_host_begin_string_descriptor(uint8_t interfaceIndex,
+                                         uint8_t descriptorIndex,
+                                         uint16_t languageId)
+{
+    hid_slot_t *slot;
+    usb_host_device_instance_t *deviceInstance;
+    usb_host_process_descriptor_param_t descriptorParam;
+    usb_host_transfer_t *transfer;
+    usb_status_t status;
+
+    if ((interfaceIndex >= MAX_HID_INTERFACES) || (s_stringState == 1U))
+    {
+        return 0;
+    }
+    slot = &s_hidSlots[interfaceIndex];
+    deviceInstance = (usb_host_device_instance_t *)slot->deviceHandle;
+    if ((slot->occupied == 0U) || (deviceInstance == NULL))
+    {
+        return 0;
+    }
+    status = USB_HostMallocTransfer(deviceInstance->hostHandle, &transfer);
+    if (status != kStatus_USB_Success)
+    {
+        return 0;
+    }
+
+    s_stringLength = 0U;
+    s_stringState = 1U;
+    transfer->setupPacket->bmRequestType = USB_REQUEST_TYPE_DIR_IN;
+    transfer->setupPacket->bRequest = USB_REQUEST_STANDARD_GET_DESCRIPTOR;
+    transfer->callbackFn = StringDescriptorCallback;
+    transfer->callbackParam = deviceInstance;
+    descriptorParam.descriptorBuffer = s_stringDescriptor;
+    descriptorParam.descriptorType = USB_DESCRIPTOR_TYPE_STRING;
+    descriptorParam.descriptorIndex = descriptorIndex;
+    descriptorParam.descriptorLength = STRING_DESCRIPTOR_CAPACITY;
+    descriptorParam.languageId = languageId;
+    status = USB_HostStandardSetGetDescriptor(deviceInstance, transfer, &descriptorParam);
+    if (status != kStatus_USB_Success)
+    {
+        s_stringState = 3U;
+        return 0;
+    }
+    return 1;
+}
+
+int32_t nxp_host_copy_string_descriptor(uint8_t *buffer, uint16_t capacity)
+{
+    uint16_t length;
+    uint16_t index;
+
+    if (s_stringState == 1U)
+    {
+        return -1;
+    }
+    if ((s_stringState != 2U) || (buffer == NULL))
+    {
+        s_stringState = 0U;
+        return 0;
+    }
+    length = s_stringLength;
+    if (capacity < length)
+    {
+        s_stringState = 0U;
+        return 0;
+    }
+    for (index = 0U; index < length; ++index)
+    {
+        buffer[index] = s_stringDescriptor[index];
+    }
+    s_stringState = 0U;
+    return (int32_t)length;
+}
+
+int32_t nxp_host_hid_get_report(uint8_t interfaceIndex,
+                                uint8_t reportId,
+                                uint8_t reportType,
+                                uint8_t *buffer,
+                                uint16_t capacity)
+{
+    hid_slot_t *slot;
+    usb_status_t status;
+    uint16_t index;
+
+    if ((interfaceIndex >= MAX_HID_INTERFACES) || (buffer == NULL) ||
+        (capacity > HID_CONTROL_REPORT_CAPACITY))
+    {
+        return -1;
+    }
+    slot = &s_hidSlots[interfaceIndex];
+    if ((slot->occupied == 0U) || (slot->classHandle == NULL))
+    {
+        return -1;
+    }
+    s_hidControlDone = 0U;
+    s_hidControlStatus = (uint8_t)kStatus_USB_Error;
+    s_hidControlLength = 0U;
+    status = USB_HostHidGetReport(slot->classHandle,
+                                  reportId,
+                                  reportType,
+                                  s_hidControlReport,
+                                  capacity,
+                                  HidControlCallback,
+                                  slot);
+    if ((status != kStatus_USB_Success) || (WaitForHidControl(slot) == 0U))
+    {
+        return -1;
+    }
+    if (s_hidControlLength > capacity)
+    {
+        return -1;
+    }
+    for (index = 0U; index < s_hidControlLength; ++index)
+    {
+        buffer[index] = s_hidControlReport[index];
+    }
+    return (int32_t)s_hidControlLength;
+}
+
+int32_t nxp_host_hid_set_report(uint8_t interfaceIndex,
+                                uint8_t reportId,
+                                uint8_t reportType,
+                                const uint8_t *buffer,
+                                uint16_t length)
+{
+    hid_slot_t *slot;
+    usb_status_t status;
+    uint16_t index;
+
+    if ((interfaceIndex >= MAX_HID_INTERFACES) || ((buffer == NULL) && (length != 0U)) ||
+        (length > HID_CONTROL_REPORT_CAPACITY))
+    {
+        return 0;
+    }
+    slot = &s_hidSlots[interfaceIndex];
+    if ((slot->occupied == 0U) || (slot->classHandle == NULL))
+    {
+        return 0;
+    }
+    for (index = 0U; index < length; ++index)
+    {
+        s_hidControlReport[index] = buffer[index];
+    }
+    s_hidControlDone = 0U;
+    s_hidControlStatus = (uint8_t)kStatus_USB_Error;
+    s_hidControlLength = 0U;
+    status = USB_HostHidSetReport(slot->classHandle,
+                                  reportId,
+                                  reportType,
+                                  s_hidControlReport,
+                                  length,
+                                  HidControlCallback,
+                                  slot);
+    if ((status != kStatus_USB_Success) || (WaitForHidControl(slot) == 0U))
+    {
+        return 0;
+    }
+    return 1;
 }
 
 int32_t nxp_device_init_clocks(void)

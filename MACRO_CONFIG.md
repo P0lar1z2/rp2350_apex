@@ -83,6 +83,18 @@ sequence = [
 
 A random repeat count is sampled once when that loop runs, not once per step.
 
+An optional `startup_sequence` runs once on each trigger start before the main
+`sequence`. Keys and mouse buttons pressed by it remain owned by the program,
+but the startup steps are not replayed by program-level repeats:
+
+```toml
+startup_sequence = [
+  { do = "keyboard.key_down", key = "key.left_ctrl" },
+  { do = "wait", ms = 100 },
+]
+sequence = [{ do = "mouse.wheel", vertical = -1 }]
+```
+
 When `alternate_sequence` is present, trigger edges alternate between
 `sequence` and `alternate_sequence`, starting with `sequence`:
 
@@ -131,12 +143,18 @@ As a frame-time reference, one rendered frame is about 6.94 ms at 144 Hz,
 are asynchronous, so validate final values from a HID event trace or training
 mode rather than assuming a report always lands in a particular game frame.
 
-The included Shift+W preset follows the direction topology shown by the
-[Apex Movement Wiki Lurch Strafing article](https://apexmovement.tech/wiki/tech/General%20Tech%3ELurch%20Tech%3ELurch%20strafe%3ELurch%20Strafing%20article):
-establish A/D before jump, then introduce the remaining directional inputs
-during the lurch window. Its first W press occurs 77–87 ms after the first
-jump-wheel event, its last forward-wheel burst ends 284–331 ms after that
-event, and one complete alternating pass takes 350–429 ms.
+The included Shift+W preset is currently a stage-one isolation test. It assumes
+W is already held before Shift starts the macro, transfers W to synthetic
+ownership without releasing it, and presses Ctrl. After a fixed 120 ms slide
+setup it jumps with an 80 ms wheel-down burst, then 120 ms after jump onset
+presses A while W remains held. W+A overlap for 100 ms, then W is released and
+A remains held for another 100 ms. Wheel-forward is emitted continuously across
+both phases of the 200 ms A hold. A is released 320 ms after jump onset and is
+the final direction press inside the 400 ms post-jump lurch window. All later
+bunny-hops are exactly 680 ms apart with no direction key held; only Ctrl and
+80 ms wheel-down bursts remain. It never presses D or S. This deliberately
+isolates a one-time leftward lurch followed by directionless momentum-preserving
+bunny-hops.
 
 Buttons are `left`, `right`, `middle`, and `button4` through `button8`.
 Program cancellation releases only buttons owned by that program; physical
