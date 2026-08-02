@@ -15,6 +15,9 @@ boot-image, programming, and readback-verification flow is also available.
 - `enet_probe`: reads the Pro board's LAN8720A identity and link state over MDIO.
 - `enet_dma_probe`: initializes five RX and three TX descriptors in non-cacheable
   OCRAM, then polls raw frames without an RTOS.
+- `gamepad_bridge`: converts an OTG2 keyboard and mouse into one fixed OTG1
+  standard HID gamepad. See [`GAMEPAD_CONVERTER.md`](../GAMEPAD_CONVERTER.md)
+  for the Apex-oriented mapping, limits, and hardware acceptance plan.
 
 ## Build
 
@@ -22,6 +25,15 @@ boot-image, programming, and readback-verification flow is also available.
 cargo build --bin host_probe
 cargo build --features nxp-host --bin host_enumerate
 cargo build --features nxp-enet --bin enet_dma_probe
+```
+
+From the repository root, build the gamepad converter with the workspace-level
+RT1052 linker configuration (avoiding duplicate child/parent `-Tlink.x` flags):
+
+```sh
+cargo build --manifest-path rt1052-bringup/Cargo.toml \
+  --target thumbv7em-none-eabihf \
+  --features nxp-host,nxp-device --bin gamepad_bridge
 ```
 
 The NXP build needs the locally ignored `.vendor/` tree documented in

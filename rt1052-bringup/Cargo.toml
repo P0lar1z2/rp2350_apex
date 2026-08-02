@@ -63,6 +63,11 @@ name = "hid_bridge"
 path = "src/bin/hid_bridge.rs"
 required-features = ["nxp-host", "nxp-device"]
 
+[[bin]]
+name = "gamepad_bridge"
+path = "src/bin/gamepad_bridge.rs"
+required-features = ["nxp-host", "nxp-device"]
+
 [profile.dev]
 opt-level = 2
 

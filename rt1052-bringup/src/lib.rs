@@ -3,6 +3,9 @@
 #[path = "../../src/usb_host/hid_report.rs"]
 pub mod hid_report;
 
+#[path = "../../src/gamepad_converter.rs"]
+pub mod gamepad_converter;
+
 pub mod control_protocol;
 
 #[cfg(feature = "nxp-enet")]
