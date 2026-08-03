@@ -365,7 +365,7 @@ pub struct ConverterConfig {
     pub mouse_min_axis: u16,
     /// Maximum generated look-stick magnitude.
     pub mouse_max_axis: u16,
-    /// Re-center the look stick if the mouse stops producing reports.
+    /// Re-center the sampled look stick if the mouse stops producing reports.
     pub mouse_release_us: u32,
     /// Hold controller Y after wheel activity; reports inside one window coalesce.
     pub wheel_button_us: u32,
@@ -379,7 +379,10 @@ pub const APEX_DEFAULT_CONFIG: ConverterConfig = ConverterConfig {
     mouse_gain_y: 192,
     mouse_min_axis: 2_048,
     mouse_max_axis: 32_767,
-    mouse_release_us: 2_500,
+    // XInput consumers sample the latest absolute controller state, commonly
+    // once per rendered frame. Hold the last mouse-derived stick value long
+    // enough for a 60 Hz consumer to observe it.
+    mouse_release_us: 20_000,
     wheel_button_us: 30_000,
     invert_look_y: false,
 };
@@ -390,6 +393,9 @@ pub struct KbmToGamepad {
     mouse_buttons: u8,
     pending_mouse_x: i32,
     pending_mouse_y: i32,
+    pending_look: bool,
+    held_mouse_x: i32,
+    held_mouse_y: i32,
     last_mouse_motion_us: u32,
     look_active: bool,
     wheel_button_until_us: u32,
@@ -404,6 +410,9 @@ impl KbmToGamepad {
             mouse_buttons: 0,
             pending_mouse_x: 0,
             pending_mouse_y: 0,
+            pending_look: false,
+            held_mouse_x: 0,
+            held_mouse_y: 0,
             last_mouse_motion_us: 0,
             look_active: false,
             wheel_button_until_us: 0,
@@ -425,6 +434,7 @@ impl KbmToGamepad {
             };
             self.pending_mouse_x = self.pending_mouse_x.saturating_add(i32::from(mouse.x));
             self.pending_mouse_y = self.pending_mouse_y.saturating_add(y);
+            self.pending_look = true;
             self.last_mouse_motion_us = now_us;
             self.look_active = true;
         }
@@ -462,10 +472,19 @@ impl KbmToGamepad {
     }
 
     /// Acknowledge that the current report was accepted by the USB endpoint.
-    /// Mouse counts collected for that report can then be discarded. Button
-    /// and keyboard state remains level-triggered until physically released.
+    ///
+    /// Relative counts are consumed exactly once, but their resulting absolute
+    /// stick sample remains visible until the next mouse batch or the release
+    /// timeout. This prevents a frame-based XInput consumer from observing only
+    /// the immediate neutral report that followed the old one-millisecond pulse.
     pub fn acknowledge_report(&mut self) {
-        self.release_look();
+        if self.pending_look {
+            self.held_mouse_x = self.pending_mouse_x;
+            self.held_mouse_y = self.pending_mouse_y;
+            self.pending_mouse_x = 0;
+            self.pending_mouse_y = 0;
+            self.pending_look = false;
+        }
     }
 
     pub fn report(&self) -> GamepadReport {
@@ -509,11 +528,17 @@ impl KbmToGamepad {
             buttons |= BUTTON_RIGHT_STICK;
         }
 
+        let (mouse_x, mouse_y) = if self.pending_look {
+            (self.pending_mouse_x, self.pending_mouse_y)
+        } else {
+            (self.held_mouse_x, self.held_mouse_y)
+        };
+
         GamepadReport {
             left_x: left.0,
             left_y: left.1,
-            right_x: scale_mouse_axis(self.pending_mouse_x, self.config.mouse_gain_x, self.config),
-            right_y: scale_mouse_axis(self.pending_mouse_y, self.config.mouse_gain_y, self.config),
+            right_x: scale_mouse_axis(mouse_x, self.config.mouse_gain_x, self.config),
+            right_y: scale_mouse_axis(mouse_y, self.config.mouse_gain_y, self.config),
             buttons,
             hat: hat_switch(self.keyboard),
             left_trigger: if self.mouse_buttons & MOUSE_RIGHT != 0 {
@@ -532,6 +557,9 @@ impl KbmToGamepad {
     fn release_look(&mut self) {
         self.pending_mouse_x = 0;
         self.pending_mouse_y = 0;
+        self.pending_look = false;
+        self.held_mouse_x = 0;
+        self.held_mouse_y = 0;
         self.look_active = false;
     }
 }
@@ -753,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_counts_accumulate_until_the_report_is_accepted() {
+    fn mouse_counts_accumulate_then_hold_for_an_xinput_sample() {
         let mut converter = KbmToGamepad::new(APEX_DEFAULT_CONFIG);
         converter.observe_mouse(mouse(0, 1, -1, 0), 100);
         converter.observe_mouse(mouse(0, 2, -3, 0), 200);
@@ -761,17 +789,27 @@ mod tests {
         assert_eq!(converter.report().right_y, -2_816);
 
         converter.acknowledge_report();
-        assert_eq!(converter.report().right_x, 0);
-        assert_eq!(converter.report().right_y, 0);
+        assert_eq!(converter.report().right_x, 2_624);
+        assert_eq!(converter.report().right_y, -2_816);
+
+        // A new batch replaces the held sample instead of accumulating it into
+        // an absolute cursor position.
+        converter.observe_mouse(mouse(0, -1, 1, 0), 1_000);
+        assert_eq!(converter.report().right_x, -2_240);
+        assert_eq!(converter.report().right_y, 2_240);
+        converter.acknowledge_report();
+        assert_eq!(converter.report().right_x, -2_240);
+        assert_eq!(converter.report().right_y, 2_240);
     }
 
     #[test]
     fn look_stick_recenters_after_timeout_and_detach_releases_buttons() {
         let mut converter = KbmToGamepad::new(APEX_DEFAULT_CONFIG);
         converter.observe_mouse(mouse(MOUSE_LEFT, 4, 2, 0), u32::MAX - 1_000);
-        converter.tick(1_000);
+        converter.acknowledge_report();
+        converter.tick(18_998);
         assert_ne!(converter.report().right_x, 0);
-        converter.tick(1_600);
+        converter.tick(18_999);
         assert_eq!(converter.report().right_x, 0);
         assert_eq!(converter.report().right_y, 0);
 
