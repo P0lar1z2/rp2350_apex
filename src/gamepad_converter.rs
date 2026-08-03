@@ -181,6 +181,11 @@ pub const HAT_LEFT: u8 = 6;
 pub const HAT_UP_LEFT: u8 = 7;
 pub const HAT_NEUTRAL: u8 = 8;
 
+// XInput.h's recommended right-thumb deadzone is 8,689. The mouse mapping
+// needs a small margin above it so a one-count movement is not discarded by a
+// game before its own response curve is applied.
+const XINPUT_RIGHT_THUMB_DEADZONE: u16 = 8_689;
+
 const KEY_A: u16 = 0x04;
 const KEY_B: u16 = 0x05;
 const KEY_C: u16 = 0x06;
@@ -377,7 +382,7 @@ pub struct ConverterConfig {
 pub const APEX_DEFAULT_CONFIG: ConverterConfig = ConverterConfig {
     mouse_gain_x: 192,
     mouse_gain_y: 192,
-    mouse_min_axis: 2_048,
+    mouse_min_axis: XINPUT_RIGHT_THUMB_DEADZONE + 1_311,
     mouse_max_axis: 32_767,
     // XInput consumers sample the latest absolute controller state, commonly
     // once per rendered frame. Hold the last mouse-derived stick value long
@@ -776,8 +781,9 @@ mod tests {
         let report = converter.report();
         assert_eq!(report.left_trigger, 255);
         assert_eq!(report.right_trigger, 255);
-        assert_eq!(report.right_x, 2_240);
+        assert_eq!(report.right_x, 10_192);
         assert_eq!(report.right_y, -32_767);
+        assert!(APEX_DEFAULT_CONFIG.mouse_min_axis > XINPUT_RIGHT_THUMB_DEADZONE);
     }
 
     #[test]
@@ -785,21 +791,21 @@ mod tests {
         let mut converter = KbmToGamepad::new(APEX_DEFAULT_CONFIG);
         converter.observe_mouse(mouse(0, 1, -1, 0), 100);
         converter.observe_mouse(mouse(0, 2, -3, 0), 200);
-        assert_eq!(converter.report().right_x, 2_624);
-        assert_eq!(converter.report().right_y, -2_816);
+        assert_eq!(converter.report().right_x, 10_576);
+        assert_eq!(converter.report().right_y, -10_768);
 
         converter.acknowledge_report();
-        assert_eq!(converter.report().right_x, 2_624);
-        assert_eq!(converter.report().right_y, -2_816);
+        assert_eq!(converter.report().right_x, 10_576);
+        assert_eq!(converter.report().right_y, -10_768);
 
         // A new batch replaces the held sample instead of accumulating it into
         // an absolute cursor position.
         converter.observe_mouse(mouse(0, -1, 1, 0), 1_000);
-        assert_eq!(converter.report().right_x, -2_240);
-        assert_eq!(converter.report().right_y, 2_240);
+        assert_eq!(converter.report().right_x, -10_192);
+        assert_eq!(converter.report().right_y, 10_192);
         converter.acknowledge_report();
-        assert_eq!(converter.report().right_x, -2_240);
-        assert_eq!(converter.report().right_y, 2_240);
+        assert_eq!(converter.report().right_x, -10_192);
+        assert_eq!(converter.report().right_y, 10_192);
     }
 
     #[test]
