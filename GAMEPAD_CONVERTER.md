@@ -97,5 +97,6 @@
 - 固件改为微软公开的 XInputHID 报告格式，新增 9 字节 Interrupt OUT，将开发 PID 改为 `cafe:1053`，产品名改为 `RT1052 XInputHID Gamepad`，避免 Windows 复用旧设备节点。
 - 主机单元测试 47 项通过；RT1052 RAM release 和 FlexSPI XIP release 均成功链接。
 - 烧写前完整读取 32 MiB W25Q256，SHA-256 为 `530d9a9f5b5f9f519c6afbc84d6c2d95a38d88b166f1eab938bc62e9b6093e67`。
-- 新镜像为 88,096 字节，擦除两个 64 KiB 扇区；镜像与独立回读 SHA-256 均为 `5dfc74b8f85c920b35d3e3153785fc100c73094e4cdeef7c102b7878eaab050d`，随后目标恢复运行。
+- 第一版 XInputHID 镜像的 283 字节 Report Descriptor 超过 `usb-device` 的 256 字节复制式 EP0 缓冲；请求未完整返回，Windows 10 将 `USB\VID_CAFE&PID_1053` 标记为 Code 10 / `CM_PROB_FAILED_START`。
+- `RuntimeHid` 改为持有固件静态描述符，并通过 `accept_with_static` 在 EP0 上直接流式发送完整 283 字节。修正镜像仍为 88,096 字节，擦除两个 64 KiB 扇区；镜像与独立回读 SHA-256 均为 `e8d8cbb82c1e821abde39ce6a80c8805ab99886e51a415ac314f06fceaeaa0e5`，随后目标恢复运行。
 - Windows `XInputGetState` 和 Apex 训练场结果仍需在目标 PC 上完成最终确认。

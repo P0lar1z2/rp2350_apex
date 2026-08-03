@@ -287,7 +287,7 @@ pub struct RuntimeHid<'a, B: UsbBus> {
     interface: InterfaceNumber,
     interrupt_in: EndpointIn<'a, B>,
     interrupt_out: Option<EndpointOut<'a, B>>,
-    report_descriptor: [u8; MAX_REPORT_DESCRIPTOR],
+    report_descriptor: &'static [u8],
     report_descriptor_len: u16,
     subclass: u8,
     protocol: u8,
@@ -302,20 +302,18 @@ pub struct RuntimeHid<'a, B: UsbBus> {
 impl<'a, B: UsbBus> RuntimeHid<'a, B> {
     pub fn new(
         alloc: &'a UsbBusAllocator<B>,
-        report_descriptor: &[u8],
+        report_descriptor: &'static [u8],
         max_packet_size: u16,
         interval: u8,
         subclass: u8,
         protocol: u8,
     ) -> Self {
         assert!(report_descriptor.len() <= MAX_REPORT_DESCRIPTOR);
-        let mut owned_descriptor = [0u8; MAX_REPORT_DESCRIPTOR];
-        owned_descriptor[..report_descriptor.len()].copy_from_slice(report_descriptor);
         Self {
             interface: alloc.interface(),
             interrupt_in: alloc.interrupt(max_packet_size, interval),
             interrupt_out: None,
-            report_descriptor: owned_descriptor,
+            report_descriptor,
             report_descriptor_len: report_descriptor.len() as u16,
             subclass,
             protocol,
@@ -331,7 +329,7 @@ impl<'a, B: UsbBus> RuntimeHid<'a, B> {
     #[allow(clippy::too_many_arguments)]
     pub fn new_bidirectional(
         alloc: &'a UsbBusAllocator<B>,
-        report_descriptor: &[u8],
+        report_descriptor: &'static [u8],
         input_max_packet_size: u16,
         input_interval: u8,
         output_max_packet_size: u16,
@@ -425,8 +423,10 @@ impl<B: UsbBus> UsbClass<B> for RuntimeHid<'_, B> {
             && req.request == 0x06
             && (req.value >> 8) as u8 == DESCRIPTOR_REPORT
         {
-            let length = usize::from(self.report_descriptor_len);
-            let _ = xfer.accept_with(&self.report_descriptor[..length]);
+            // XInputHID's standardized descriptor is 283 bytes, larger than
+            // usb-device's copied 256-byte control buffer. The descriptor has
+            // firmware-static lifetime, so stream it directly over EP0.
+            let _ = xfer.accept_with_static(self.report_descriptor);
             return;
         }
         if req.request_type != RequestType::Class {
