@@ -380,8 +380,8 @@ pub struct ConverterConfig {
 /// Conservative starting point for Apex. Final sensitivity and deadzone must be
 /// calibrated with the actual mouse DPI and the game's controller settings.
 pub const APEX_DEFAULT_CONFIG: ConverterConfig = ConverterConfig {
-    mouse_gain_x: 768,
-    mouse_gain_y: 768,
+    mouse_gain_x: 1_024,
+    mouse_gain_y: 1_024,
     mouse_min_axis: XINPUT_RIGHT_THUMB_DEADZONE + 1_311,
     mouse_max_axis: 32_767,
     // XInput consumers sample the latest absolute controller state, commonly
@@ -781,7 +781,7 @@ mod tests {
         let report = converter.report();
         assert_eq!(report.left_trigger, 255);
         assert_eq!(report.right_trigger, 255);
-        assert_eq!(report.right_x, 10_768);
+        assert_eq!(report.right_x, 11_024);
         assert_eq!(report.right_y, -32_767);
         assert!(APEX_DEFAULT_CONFIG.mouse_min_axis > XINPUT_RIGHT_THUMB_DEADZONE);
     }
@@ -791,21 +791,21 @@ mod tests {
         let mut converter = KbmToGamepad::new(APEX_DEFAULT_CONFIG);
         converter.observe_mouse(mouse(0, 1, -1, 0), 100);
         converter.observe_mouse(mouse(0, 2, -3, 0), 200);
-        assert_eq!(converter.report().right_x, 12_304);
-        assert_eq!(converter.report().right_y, -13_072);
+        assert_eq!(converter.report().right_x, 13_072);
+        assert_eq!(converter.report().right_y, -14_096);
 
         converter.acknowledge_report();
-        assert_eq!(converter.report().right_x, 12_304);
-        assert_eq!(converter.report().right_y, -13_072);
+        assert_eq!(converter.report().right_x, 13_072);
+        assert_eq!(converter.report().right_y, -14_096);
 
         // A new batch replaces the held sample instead of accumulating it into
         // an absolute cursor position.
         converter.observe_mouse(mouse(0, -1, 1, 0), 1_000);
-        assert_eq!(converter.report().right_x, -10_768);
-        assert_eq!(converter.report().right_y, 10_768);
+        assert_eq!(converter.report().right_x, -11_024);
+        assert_eq!(converter.report().right_y, 11_024);
         converter.acknowledge_report();
-        assert_eq!(converter.report().right_x, -10_768);
-        assert_eq!(converter.report().right_y, 10_768);
+        assert_eq!(converter.report().right_x, -11_024);
+        assert_eq!(converter.report().right_y, 11_024);
     }
 
     #[test]
