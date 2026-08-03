@@ -16,8 +16,9 @@ boot-image, programming, and readback-verification flow is also available.
 - `enet_dma_probe`: initializes five RX and three TX descriptors in non-cacheable
   OCRAM, then polls raw frames without an RTOS.
 - `gamepad_bridge`: converts an OTG2 keyboard and mouse into one fixed OTG1
-  standard HID gamepad. See [`GAMEPAD_CONVERTER.md`](../GAMEPAD_CONVERTER.md)
-  for the Apex-oriented mapping, limits, and hardware acceptance plan.
+  Microsoft XInputHID-compatible gamepad. See
+  [`GAMEPAD_CONVERTER.md`](../GAMEPAD_CONVERTER.md) for the Apex-oriented
+  mapping, limits, and hardware acceptance plan.
 
 ## Build
 
@@ -96,6 +97,10 @@ python3 -m venv .venv-pyocd
 # Global options must appear before the subcommand.
 ./tools/flash.py --bin gamepad_bridge flash --yes
 
+# Reuse a complete validated backup after a transient DAP disconnect.
+./tools/flash.py --bin gamepad_bridge flash \
+  --backup .flash/w25q256-YYYYMMDD-HHMMSS.bin --yes
+
 # Retry readback/boot only after a transient DAP reconnect failure.
 ./tools/flash.py verify .flash/hid_bridge-rt1052-boot.bin
 ```
@@ -104,6 +109,17 @@ The generated image is `.flash/<binary>-rt1052-boot.bin`. Without `--yes`, the
 `flash` command stops after backup and image creation. Keep at least one full
 backup outside the repository before programming. The workflow does not burn
 eFuses and does not perform a whole-chip erase.
+
+On Windows, verify that the inbox XInput layer sees the converter independently
+of a game:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\check-xinput.ps1
+```
+
+The script calls the system `xinput1_4.dll` directly and prints only state
+changes for slots 0 through 3. `NO_XINPUT_CONTROLLER` means that Windows bound
+only its generic HID/DirectInput path or that no XInput controller is present.
 
 Hardware verification programmed 108,576 image bytes after erasing two 64 KiB
 sectors. The complete programmed range matched its SHA-256 readback, then an

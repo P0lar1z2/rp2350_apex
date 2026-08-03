@@ -39,7 +39,9 @@ const CAP_MOUSE: u8 = 1 << 1;
 
 // Development-only placeholder. A distributed product needs an assigned VID/PID.
 const GAMEPAD_VID: u16 = 0xcafe;
-const GAMEPAD_PID: u16 = 0x1052;
+// Use a new development PID so Windows does not reuse the old DirectInput-only
+// device node after the report descriptor changes to the XInputHID profile.
+const GAMEPAD_PID: u16 = 0x1053;
 
 #[unsafe(link_section = ".usb_device.endpoint_memory")]
 static EP_MEMORY: EndpointMemory<2048> = EndpointMemory::new();
@@ -470,20 +472,25 @@ fn main() -> ! {
         &EP_STATE,
         Speed::LowFull,
     ));
-    let mut hid = RuntimeHid::new(
+    let neutral_report = GamepadReport::neutral().encode();
+    let mut hid = RuntimeHid::new_bidirectional(
         &bus,
         GAMEPAD_REPORT_DESCRIPTOR,
         GamepadReport::LEN as u16,
         1,
+        9,
+        1,
         0,
         0,
     );
+    hid.set_input_report(&neutral_report);
     let strings = [StringDescriptors::new(LangID::from(0x0409))
         .manufacturer("xense")
-        .product("RT1052 KBM Gamepad")];
+        .product("RT1052 XInputHID Gamepad")
+        .serial_number("XENSE-XINPUTHID-0001")];
     let mut device = UsbDeviceBuilder::new(&bus, UsbVidPid(GAMEPAD_VID, GAMEPAD_PID))
         .usb_rev(UsbRev::Usb200)
-        .device_release(0x0100)
+        .device_release(0x0200)
         .max_power(100)
         .expect("gamepad USB power is valid")
         .max_packet_size_0(64)
@@ -494,7 +501,7 @@ fn main() -> ! {
 
     let mut converter = KbmToGamepad::new(APEX_DEFAULT_CONFIG);
     let mut device_configured = false;
-    let mut last_sent = GamepadReport::neutral().encode();
+    let mut last_sent = neutral_report;
     let mut last_sent_valid = false;
     let mut last_sent_at = clock.now_us();
     let mut forwarded = 0u32;
@@ -642,7 +649,8 @@ fn main() -> ! {
 
         let now = clock.now_us();
         converter.tick(now);
-        let desired = converter.report().encode();
+        let desired_state = converter.report();
+        let desired = desired_state.encode();
         let keepalive_due = now.wrapping_sub(last_sent_at) >= GAMEPAD_KEEPALIVE_US;
         if device_configured && (!last_sent_valid || desired != last_sent || keepalive_due) {
             match hid.push_report(&desired) {
@@ -656,14 +664,14 @@ fn main() -> ! {
                         rprintln!(
                             "gamepad #{} lx={} ly={} rx={} ry={} buttons={:#06x} hat={} lt={} rt={} errors={}",
                             forwarded,
-                            i16::from_le_bytes([desired[0], desired[1]]),
-                            i16::from_le_bytes([desired[2], desired[3]]),
-                            i16::from_le_bytes([desired[4], desired[5]]),
-                            i16::from_le_bytes([desired[6], desired[7]]),
-                            u16::from_le_bytes([desired[8], desired[9]]),
-                            desired[10],
-                            desired[11],
-                            desired[12],
+                            desired_state.left_x,
+                            desired_state.left_y,
+                            desired_state.right_x,
+                            desired_state.right_y,
+                            desired_state.buttons,
+                            desired_state.hat,
+                            desired_state.left_trigger,
+                            desired_state.right_trigger,
                             send_errors
                         );
                     }

@@ -6,57 +6,158 @@
 
 use crate::usb_host::{KeyboardState, MouseState};
 
-/// Standard HID gamepad descriptor matching [`GamepadReport::encode`].
+/// Microsoft XInputHID gamepad descriptor matching [`GamepadReport::encode`].
 ///
-/// Report layout: four signed 16-bit sticks, 16 buttons, one hat nibble plus
-/// padding, then two unsigned 8-bit triggers. There is no Report ID.
+/// This is the standardized descriptor published in Microsoft's April 2025
+/// GIP documentation. Report 1 is the cross-platform gamepad input report and
+/// report 2 is the optional four-motor rumble output report. Following this
+/// layout lets the Windows inbox `xinputhid.sys` filter expose the otherwise
+/// standard HID device through XInput without impersonating an Xbox VID/PID.
 pub const GAMEPAD_REPORT_DESCRIPTOR: &[u8] = &[
     0x05, 0x01, // Usage Page (Generic Desktop)
     0x09, 0x05, // Usage (Game Pad)
     0xa1, 0x01, // Collection (Application)
+    0x85, 0x01, //   Report ID (1 / gamepad input)
+    // Left thumbstick.
     0x09, 0x01, //   Usage (Pointer)
     0xa1, 0x00, //   Collection (Physical)
-    0x09, 0x30, //     Usage (X)
-    0x09, 0x31, //     Usage (Y)
-    0x09, 0x33, //     Usage (Rx)
-    0x09, 0x34, //     Usage (Ry)
-    0x16, 0x01, 0x80, // Logical Minimum (-32767)
-    0x26, 0xff, 0x7f, // Logical Maximum (32767)
-    0x75, 0x10, //     Report Size (16)
-    0x95, 0x04, //     Report Count (4)
+    0x09, 0x30, //       Usage (X)
+    0x09, 0x31, //       Usage (Y)
+    0x15, 0x00, //       Logical Minimum (0)
+    0x27, 0xff, 0xff, 0x00, 0x00, // Logical Maximum (65535)
+    0x95, 0x02, //       Report Count (2)
+    0x75, 0x10, //       Report Size (16)
     0x81, 0x02, //     Input (Data, Variable, Absolute)
-    0xc0, //          End Collection
-    0x05, 0x09, //   Usage Page (Button)
-    0x19, 0x01, //   Usage Minimum (Button 1)
-    0x29, 0x10, //   Usage Maximum (Button 16)
+    0xc0, //            End Collection
+    // Right thumbstick.
+    0x09, 0x01, //   Usage (Pointer)
+    0xa1, 0x00, //   Collection (Physical)
+    0x09, 0x32, //       Usage (Z)
+    0x09, 0x35, //       Usage (Rz)
+    0x15, 0x00, //       Logical Minimum (0)
+    0x27, 0xff, 0xff, 0x00, 0x00, // Logical Maximum (65535)
+    0x95, 0x02, //       Report Count (2)
+    0x75, 0x10, //       Report Size (16)
+    0x81, 0x02, //       Input (Data, Variable, Absolute)
+    0xc0, //            End Collection
+    // Left trigger: 10 data bits followed by 6 padding bits.
+    0x05, 0x02, //   Usage Page (Simulation Controls)
+    0x09, 0xc5, //   Usage (Brake)
     0x15, 0x00, //   Logical Minimum (0)
-    0x25, 0x01, //   Logical Maximum (1)
-    0x75, 0x01, //   Report Size (1)
-    0x95, 0x10, //   Report Count (16)
+    0x26, 0xff, 0x03, // Logical Maximum (1023)
+    0x95, 0x01, //   Report Count (1)
+    0x75, 0x0a, //   Report Size (10)
     0x81, 0x02, //   Input (Data, Variable, Absolute)
+    0x15, 0x00, //   Logical Minimum (0)
+    0x25, 0x00, //   Logical Maximum (0)
+    0x75, 0x06, //   Report Size (6)
+    0x95, 0x01, //   Report Count (1)
+    0x81, 0x03, //   Input (Constant)
+    // Right trigger: 10 data bits followed by 6 padding bits.
+    0x05, 0x02, //   Usage Page (Simulation Controls)
+    0x09, 0xc4, //   Usage (Accelerator)
+    0x15, 0x00, //   Logical Minimum (0)
+    0x26, 0xff, 0x03, // Logical Maximum (1023)
+    0x95, 0x01, //   Report Count (1)
+    0x75, 0x0a, //   Report Size (10)
+    0x81, 0x02, //   Input (Data, Variable, Absolute)
+    0x15, 0x00, //   Logical Minimum (0)
+    0x25, 0x00, //   Logical Maximum (0)
+    0x75, 0x06, //   Report Size (6)
+    0x95, 0x01, //   Report Count (1)
+    0x81, 0x03, //   Input (Constant)
+    // D-pad. XInputHID requires zero for the neutral position.
     0x05, 0x01, //   Usage Page (Generic Desktop)
     0x09, 0x39, //   Usage (Hat Switch)
-    0x15, 0x00, //   Logical Minimum (0)
-    0x25, 0x07, //   Logical Maximum (7)
+    0x15, 0x01, //   Logical Minimum (1)
+    0x25, 0x08, //   Logical Maximum (8)
     0x35, 0x00, //   Physical Minimum (0)
     0x46, 0x3b, 0x01, // Physical Maximum (315)
-    0x65, 0x14, //   Unit (Degrees)
+    0x66, 0x14, 0x00, // Unit (Degrees)
     0x75, 0x04, //   Report Size (4)
     0x95, 0x01, //   Report Count (1)
     0x81, 0x42, //   Input (Data, Variable, Absolute, Null State)
-    0x65, 0x00, //   Unit (None)
-    0x45, 0x00, //   Physical Maximum (0 / unspecified)
     0x75, 0x04, //   Report Size (4)
     0x95, 0x01, //   Report Count (1)
-    0x81, 0x03, //   Input (Constant, Variable, Absolute)
-    0x09, 0x32, //   Usage (Z / left trigger)
-    0x09, 0x35, //   Usage (Rz / right trigger)
     0x15, 0x00, //   Logical Minimum (0)
-    0x26, 0xff, 0x00, // Logical Maximum (255)
-    0x75, 0x08, //   Report Size (8)
-    0x95, 0x02, //   Report Count (2)
+    0x25, 0x00, //   Logical Maximum (0)
+    0x35, 0x00, //   Physical Minimum (0 / unspecified)
+    0x45, 0x00, //   Physical Maximum (0 / unspecified)
+    0x65, 0x00, //   Unit (None)
+    0x81, 0x03, //   Input (Constant)
+    // Fifteen digital buttons plus one padding bit.
+    0x05, 0x09, //   Usage Page (Button)
+    0x19, 0x01, //   Usage Minimum (Button 1)
+    0x29, 0x0f, //   Usage Maximum (Button 15)
+    0x15, 0x00, //   Logical Minimum (0)
+    0x25, 0x01, //   Logical Maximum (1)
+    0x75, 0x01, //   Report Size (1)
+    0x95, 0x0f, //   Report Count (15)
     0x81, 0x02, //   Input (Data, Variable, Absolute)
-    0xc0, //        End Collection
+    0x15, 0x00, //   Logical Minimum (0)
+    0x25, 0x00, //   Logical Maximum (0)
+    0x75, 0x01, //   Report Size (1)
+    0x95, 0x01, //   Report Count (1)
+    0x81, 0x03, //   Input (Constant)
+    // Share button and seven padding bits.
+    0x05, 0x0c, //   Usage Page (Consumer)
+    0x0a, 0xb2, 0x00, // Usage (Record)
+    0x15, 0x00, //   Logical Minimum (0)
+    0x25, 0x01, //   Logical Maximum (1)
+    0x95, 0x01, //   Report Count (1)
+    0x75, 0x01, //   Report Size (1)
+    0x81, 0x02, //   Input (Data, Variable, Absolute)
+    0x15, 0x00, //   Logical Minimum (0)
+    0x25, 0x00, //   Logical Maximum (0)
+    0x75, 0x07, //   Report Size (7)
+    0x95, 0x01, //   Report Count (1)
+    0x81, 0x03, //   Input (Constant)
+    // Report 2: Xbox One-compatible four-motor rumble output.
+    0x05, 0x0f, //   Usage Page (Physical Interface)
+    0x09, 0x21, //   Usage (Set Effect Report)
+    0x85, 0x02, //   Report ID (2 / rumble output)
+    0xa1, 0x02, //   Collection (Logical)
+    0x09, 0x97, //     Usage (DC Enable Actuators)
+    0x15, 0x00, //     Logical Minimum (0)
+    0x25, 0x01, //     Logical Maximum (1)
+    0x75, 0x04, //     Report Size (4)
+    0x95, 0x01, //     Report Count (1)
+    0x91, 0x02, //     Output (Data, Variable, Absolute)
+    0x15, 0x00, //     Logical Minimum (0)
+    0x25, 0x00, //     Logical Maximum (0)
+    0x75, 0x04, //     Report Size (4)
+    0x95, 0x01, //     Report Count (1)
+    0x91, 0x03, //     Output (Constant)
+    0x09, 0x70, //     Usage (Magnitude)
+    0x15, 0x00, //     Logical Minimum (0)
+    0x25, 0x64, //     Logical Maximum (100)
+    0x75, 0x08, //   Report Size (8)
+    0x95, 0x04, //     Report Count (4)
+    0x91, 0x02, //     Output (Data, Variable, Absolute)
+    0x09, 0x50, //     Usage (Duration)
+    0x66, 0x01, 0x10, // Unit (Seconds)
+    0x55, 0x0e, //     Unit Exponent (-2 / 10 ms)
+    0x15, 0x00, //     Logical Minimum (0)
+    0x26, 0xff, 0x00, // Logical Maximum (255)
+    0x75, 0x08, //     Report Size (8)
+    0x95, 0x01, //     Report Count (1)
+    0x91, 0x02, //     Output (Data, Variable, Absolute)
+    0x09, 0xa7, //     Usage (Start Delay)
+    0x15, 0x00, //     Logical Minimum (0)
+    0x26, 0xff, 0x00, // Logical Maximum (255)
+    0x75, 0x08, //     Report Size (8)
+    0x95, 0x01, //     Report Count (1)
+    0x91, 0x02, //     Output (Data, Variable, Absolute)
+    0x65, 0x00, //     Unit (None)
+    0x55, 0x00, //     Unit Exponent (None)
+    0x09, 0x7c, //     Usage (Loop Count)
+    0x15, 0x00, //     Logical Minimum (0)
+    0x26, 0xff, 0x00, // Logical Maximum (255)
+    0x75, 0x08, //     Report Size (8)
+    0x95, 0x01, //     Report Count (1)
+    0x91, 0x02, //     Output (Data, Variable, Absolute)
+    0xc0, //          End Collection (Rumble)
+    0xc0, //        End Collection (Gamepad)
 ];
 
 pub const BUTTON_SOUTH: u16 = 1 << 0;
@@ -125,7 +226,8 @@ pub struct GamepadReport {
 }
 
 impl GamepadReport {
-    pub const LEN: usize = 13;
+    /// Report ID plus sixteen bytes of XInputHID gamepad payload.
+    pub const LEN: usize = 17;
 
     pub const fn neutral() -> Self {
         Self {
@@ -142,16 +244,31 @@ impl GamepadReport {
 
     pub fn encode(self) -> [u8; Self::LEN] {
         let mut bytes = [0u8; Self::LEN];
-        bytes[0..2].copy_from_slice(&self.left_x.to_le_bytes());
-        bytes[2..4].copy_from_slice(&self.left_y.to_le_bytes());
-        bytes[4..6].copy_from_slice(&self.right_x.to_le_bytes());
-        bytes[6..8].copy_from_slice(&self.right_y.to_le_bytes());
-        bytes[8..10].copy_from_slice(&self.buttons.to_le_bytes());
-        bytes[10] = self.hat & 0x0f;
-        bytes[11] = self.left_trigger;
-        bytes[12] = self.right_trigger;
+        bytes[0] = 1;
+        bytes[1..3].copy_from_slice(&signed_axis_to_hid(self.left_x).to_le_bytes());
+        bytes[3..5].copy_from_slice(&signed_axis_to_hid(self.left_y).to_le_bytes());
+        bytes[5..7].copy_from_slice(&signed_axis_to_hid(self.right_x).to_le_bytes());
+        bytes[7..9].copy_from_slice(&signed_axis_to_hid(self.right_y).to_le_bytes());
+        bytes[9..11].copy_from_slice(&trigger_to_xinput_hid(self.left_trigger).to_le_bytes());
+        bytes[11..13].copy_from_slice(&trigger_to_xinput_hid(self.right_trigger).to_le_bytes());
+        bytes[13] = if self.hat == HAT_NEUTRAL {
+            0
+        } else {
+            self.hat.min(HAT_UP_LEFT) + 1
+        };
+        bytes[14..16].copy_from_slice(&(self.buttons & 0x7fff).to_le_bytes());
+        // Byte 16 is the Share button plus seven padding bits. No keyboard
+        // input is mapped to Share in the Apex profile.
         bytes
     }
+}
+
+const fn signed_axis_to_hid(value: i16) -> u16 {
+    (value as i32 + 32_768) as u16
+}
+
+const fn trigger_to_xinput_hid(value: u8) -> u16 {
+    (value as u32 * 1_023 / 255) as u16
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -425,8 +542,37 @@ mod tests {
     #[test]
     fn neutral_report_matches_wire_layout() {
         let report = GamepadReport::neutral();
-        assert_eq!(report.encode(), [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0]);
+        assert_eq!(
+            report.encode(),
+            [1, 0, 128, 0, 128, 0, 128, 0, 128, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(GAMEPAD_REPORT_DESCRIPTOR.len(), 283);
         assert_eq!(GAMEPAD_REPORT_DESCRIPTOR.last(), Some(&0xc0));
+    }
+
+    #[test]
+    fn xinput_hid_wire_layout_scales_axes_triggers_hat_and_buttons() {
+        let report = GamepadReport {
+            left_x: i16::MIN,
+            left_y: i16::MAX,
+            right_x: 0,
+            right_y: -1,
+            buttons: u16::MAX,
+            hat: HAT_DOWN_RIGHT,
+            left_trigger: u8::MAX,
+            right_trigger: 128,
+        }
+        .encode();
+
+        assert_eq!(u16::from_le_bytes([report[1], report[2]]), 0);
+        assert_eq!(u16::from_le_bytes([report[3], report[4]]), u16::MAX);
+        assert_eq!(u16::from_le_bytes([report[5], report[6]]), 32_768);
+        assert_eq!(u16::from_le_bytes([report[7], report[8]]), 32_767);
+        assert_eq!(u16::from_le_bytes([report[9], report[10]]), 1_023);
+        assert_eq!(u16::from_le_bytes([report[11], report[12]]), 513);
+        assert_eq!(report[13], 4);
+        assert_eq!(u16::from_le_bytes([report[14], report[15]]), 0x7fff);
+        assert_eq!(report[16], 0);
     }
 
     #[test]

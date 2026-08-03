@@ -4,7 +4,9 @@ use usb_device::{
     Result as UsbResult, UsbError,
     bus::StringIndex,
     bus::{InterfaceNumber, UsbBus, UsbBusAllocator},
-    class_prelude::{ControlIn, ControlOut, DescriptorWriter, EndpointIn, UsbClass},
+    class_prelude::{
+        ControlIn, ControlOut, DescriptorWriter, EndpointAddress, EndpointIn, EndpointOut, UsbClass,
+    },
     control::{Recipient, RequestType},
     descriptor::lang_id::LangID,
 };
@@ -22,6 +24,7 @@ const REQUEST_SET_PROTOCOL: u8 = 0x0b;
 pub const MAX_REPORT_DESCRIPTOR: usize = 512;
 pub const MAX_HID_INTERFACES: usize = 6;
 const MAX_CONTROL_REPORT: usize = 256;
+const MAX_INTERRUPT_REPORT: usize = 64;
 
 #[derive(Clone, Copy)]
 pub struct HidReportProxy {
@@ -283,12 +286,17 @@ pub const fn high_speed_interval(source_speed: u8, source_interval: u8) -> u8 {
 pub struct RuntimeHid<'a, B: UsbBus> {
     interface: InterfaceNumber,
     interrupt_in: EndpointIn<'a, B>,
+    interrupt_out: Option<EndpointOut<'a, B>>,
     report_descriptor: [u8; MAX_REPORT_DESCRIPTOR],
     report_descriptor_len: u16,
     subclass: u8,
     protocol: u8,
     selected_protocol: u8,
     idle: u8,
+    input_report: [u8; MAX_INTERRUPT_REPORT],
+    input_report_len: u8,
+    output_report: [u8; MAX_INTERRUPT_REPORT],
+    output_report_len: u8,
 }
 
 impl<'a, B: UsbBus> RuntimeHid<'a, B> {
@@ -306,21 +314,77 @@ impl<'a, B: UsbBus> RuntimeHid<'a, B> {
         Self {
             interface: alloc.interface(),
             interrupt_in: alloc.interrupt(max_packet_size, interval),
+            interrupt_out: None,
             report_descriptor: owned_descriptor,
             report_descriptor_len: report_descriptor.len() as u16,
             subclass,
             protocol,
             selected_protocol: 1,
             idle: 0,
+            input_report: [0; MAX_INTERRUPT_REPORT],
+            input_report_len: 0,
+            output_report: [0; MAX_INTERRUPT_REPORT],
+            output_report_len: 0,
         }
     }
 
-    pub fn push_report(&self, report: &[u8]) -> UsbResult<usize> {
-        self.interrupt_in.write(report)
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_bidirectional(
+        alloc: &'a UsbBusAllocator<B>,
+        report_descriptor: &[u8],
+        input_max_packet_size: u16,
+        input_interval: u8,
+        output_max_packet_size: u16,
+        output_interval: u8,
+        subclass: u8,
+        protocol: u8,
+    ) -> Self {
+        let mut hid = Self::new(
+            alloc,
+            report_descriptor,
+            input_max_packet_size,
+            input_interval,
+            subclass,
+            protocol,
+        );
+        hid.interrupt_out = Some(alloc.interrupt(
+            output_max_packet_size.clamp(1, MAX_INTERRUPT_REPORT as u16),
+            output_interval.max(1),
+        ));
+        hid
+    }
+
+    pub fn set_input_report(&mut self, report: &[u8]) {
+        let length = report.len().min(self.input_report.len());
+        self.input_report[..length].copy_from_slice(&report[..length]);
+        self.input_report_len = length as u8;
+    }
+
+    pub fn push_report(&mut self, report: &[u8]) -> UsbResult<usize> {
+        let written = self.interrupt_in.write(report)?;
+        self.set_input_report(&report[..written]);
+        Ok(written)
+    }
+
+    pub fn take_output_report(&mut self, destination: &mut [u8]) -> Option<usize> {
+        let source_length = usize::from(self.output_report_len);
+        if source_length == 0 {
+            return None;
+        }
+        let copied = source_length.min(destination.len());
+        destination[..copied].copy_from_slice(&self.output_report[..copied]);
+        self.output_report_len = 0;
+        Some(copied)
     }
 
     fn matches_interface(&self, index: u16) -> bool {
         index as u8 == u8::from(self.interface)
+    }
+
+    fn store_output_report(&mut self, report: &[u8]) {
+        let length = report.len().min(self.output_report.len());
+        self.output_report[..length].copy_from_slice(&report[..length]);
+        self.output_report_len = length as u8;
     }
 }
 
@@ -328,6 +392,7 @@ impl<B: UsbBus> UsbClass<B> for RuntimeHid<'_, B> {
     fn reset(&mut self) {
         self.selected_protocol = 1;
         self.idle = 0;
+        self.output_report_len = 0;
     }
 
     fn get_configuration_descriptors(&self, writer: &mut DescriptorWriter) -> UsbResult<()> {
@@ -344,7 +409,11 @@ impl<B: UsbBus> UsbClass<B> for RuntimeHid<'_, B> {
                 (self.report_descriptor_len >> 8) as u8,
             ],
         )?;
-        writer.endpoint(&self.interrupt_in)
+        writer.endpoint(&self.interrupt_in)?;
+        if let Some(interrupt_out) = self.interrupt_out.as_ref() {
+            writer.endpoint(interrupt_out)?;
+        }
+        Ok(())
     }
 
     fn control_in(&mut self, xfer: ControlIn<B>) {
@@ -365,7 +434,15 @@ impl<B: UsbBus> UsbClass<B> for RuntimeHid<'_, B> {
         }
         match req.request {
             REQUEST_GET_REPORT => {
-                let _ = xfer.accept_with(&[]);
+                let report_type = (req.value >> 8) as u8;
+                let report_id = req.value as u8;
+                let length = usize::from(self.input_report_len);
+                if report_type == 1
+                    && length != 0
+                    && (report_id == 0 || self.input_report[0] == report_id)
+                {
+                    let _ = xfer.accept_with(&self.input_report[..length]);
+                }
             }
             REQUEST_GET_IDLE => {
                 let _ = xfer.accept_with(core::slice::from_ref(&self.idle));
@@ -386,6 +463,16 @@ impl<B: UsbBus> UsbClass<B> for RuntimeHid<'_, B> {
             return;
         }
         match req.request {
+            REQUEST_SET_REPORT => {
+                let report_type = (req.value >> 8) as u8;
+                let report_id = req.value as u8;
+                let data = xfer.data();
+                if report_type != 2 || (report_id != 0 && data.first().copied() != Some(report_id))
+                {
+                    return;
+                }
+                self.store_output_report(data);
+            }
             REQUEST_SET_IDLE => self.idle = (req.value >> 8) as u8,
             REQUEST_SET_PROTOCOL if self.subclass != 0 => {
                 self.selected_protocol = req.value as u8;
@@ -393,6 +480,22 @@ impl<B: UsbBus> UsbClass<B> for RuntimeHid<'_, B> {
             _ => return,
         }
         let _ = xfer.accept();
+    }
+
+    fn endpoint_out(&mut self, address: EndpointAddress) {
+        let mut report = [0u8; MAX_INTERRUPT_REPORT];
+        let result = {
+            let Some(endpoint) = self.interrupt_out.as_ref() else {
+                return;
+            };
+            if endpoint.address() != address {
+                return;
+            }
+            endpoint.read(&mut report)
+        };
+        if let Ok(length) = result {
+            self.store_output_report(&report[..length]);
+        }
     }
 }
 

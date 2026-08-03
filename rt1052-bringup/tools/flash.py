@@ -131,7 +131,22 @@ def backup(args: argparse.Namespace) -> Path:
         "-c",
         "go",
     ]
-    run(command)
+    try:
+        run(command)
+    except subprocess.CalledProcessError as error:
+        # Some CMSIS-DAP firmware revisions disconnect during pyOCD's board
+        # uninitialization after `savemem` has already completed. A complete,
+        # structurally valid 32 MiB image is still a usable backup; any short
+        # read or corrupt boot header remains fatal.
+        try:
+            validate_backup(output)
+        except SystemExit:
+            raise error
+        print(
+            "warning: pyOCD disconnected after a complete backup; "
+            "continuing with the validated image",
+            flush=True,
+        )
     validate_backup(output)
     digest = sha256(output)
     output.with_suffix(".sha256").write_text(f"{digest}  {output.name}\n", encoding="ascii")
@@ -262,7 +277,12 @@ def boot_target(args: argparse.Namespace) -> None:
 
 
 def flash(args: argparse.Namespace) -> None:
-    backup_path = backup(args)
+    if args.backup:
+        backup_path = args.backup.resolve()
+        validate_backup(backup_path)
+        print(f"using validated backup: {backup_path}")
+    else:
+        backup_path = backup(args)
     image_path = build_image(args, backup_path)
     if not args.yes:
         raise SystemExit(
@@ -305,6 +325,11 @@ def parser() -> argparse.ArgumentParser:
     build_parser.add_argument("backup", type=Path)
     flash_parser = sub.add_parser("flash", help="back up, build, program, and verify")
     flash_parser.add_argument("--output", help="path for the pre-flash backup")
+    flash_parser.add_argument(
+        "--backup",
+        type=Path,
+        help="reuse an existing validated 32 MiB backup instead of reading a new one",
+    )
     flash_parser.add_argument("--yes", action="store_true", help="confirm sector erase/programming")
     verify_parser = sub.add_parser("verify", help="read back an existing image and boot it")
     verify_parser.add_argument("image", type=Path)
