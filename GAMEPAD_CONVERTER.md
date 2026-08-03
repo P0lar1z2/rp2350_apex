@@ -2,7 +2,7 @@
 
 ## 目标
 
-在 i.MX RT1052 Pro 上新增独立固件 `gamepad_bridge`：OTG2 Host 接收物理键盘与鼠标的 HID 输入，转换为微软标准化的 XInputHID Gamepad 报告，再由 OTG1 Device 发送给 PC。Windows 通过系统自带 `xinputhid.sys` 将它公开给 XInput 游戏；其他系统仍可按标准 HID Gamepad 使用。首版面向 PC 版 Apex 的训练场验证。
+在 i.MX RT1052 Pro 上新增独立固件 `gamepad_bridge`：OTG2 Host 接收物理键盘与鼠标的 HID 输入，转换为手柄状态，再由 OTG1 Device 发送给 PC。最终目标仍是使用微软标准化的 XInputHID 报告与合法分配的设备标识；当前烧写候选先临时切换到 Xbox 360 有线 XUSB 模式，以单独验证 Windows、XInput 和 Apex 的完整输入链路。
 
 本功能是输入方式与无障碍原型，只做当前物理输入到当前手柄状态的确定性映射。不得加入压枪、自动瞄准、连点、自动身法、定时组合技、随机化规避或其他自动化逻辑；也不宣称或保证获得任何游戏辅助效果。
 
@@ -10,10 +10,11 @@
 
 - 开发板：野火 i.MX RT1052 Pro。
 - OTG2：连接板载 Hub，再连接一个鼠标和一个键盘；允许两者来自不同 USB 设备。
-- OTG1：连接 PC，枚举为单接口、全速、1 ms 轮询的标准 HID Gamepad；Interrupt IN 为 17 字节，Interrupt OUT 为 9 字节。
-- 报告描述符逐字节采用微软 2025 年 4 月公开的 [XInputHID 规范包](https://aka.ms/gipdocs)：输入 Report ID 1，震动输出 Report ID 2。它不是已经弃用的 XUSB 协议，也不冒用 Xbox、PlayStation 等设备的 VID/PID。
-- 固件中的 `cafe:1053` 是仅供开发验证的占位 VID/PID；发布产品前必须替换为合法分配的标识。
-- Windows 必须包含支持该规范的系统 `xinputhid.sys`。可用 `tools/check-xinput.ps1` 直接调用 `XInputGetState` 验证；若目标系统只把它当作 DirectInput 手柄，可暂用 [Steam Input](https://partner.steamgames.com/doc/features/steam_controller/getting_started_for_players?l=english) 适配。
+- OTG1：连接 PC。标准方案枚举为单接口 XInputHID Gamepad；当前临时验证方案枚举为 Xbox 360 有线设备的四个厂商接口，游戏报告端点为 32 字节、实际输入包为 20 字节、输出命令为 8 字节。
+- 标准方案的报告描述符逐字节采用微软 2025 年 4 月公开的 [XInputHID 规范包](https://aka.ms/gipdocs)：输入 Report ID 1，震动输出 Report ID 2；对应实现仍保留在源码中。
+- 当前验证镜像临时使用 `045e:028e`、设备级 `ff/ff/ff` 和接口 `ff/5d/01`，让 Windows 10 直接加载 Xbox 360 系统驱动。该 Microsoft VID/PID 仅用于本机原型排障，禁止作为产品标识或对外分发；发布前必须恢复合法分配的 VID/PID 与正式驱动绑定方案。
+- XUSB 四接口布局和 20 字节报告格式参考已在 Windows PC 上验证的 MIT 许可 [GP2040-CE XInput 实现](https://github.com/OpenStickCommunity/GP2040-CE/tree/main/src/drivers/xinput)。当前目标仅为 Windows PC，未实现也不尝试绕过 Xbox 主机认证。
+- 可用 `tools/check-xinput.ps1` 直接调用 `XInputGetState` 验证；若标准 XInputHID 方案只被识别为 DirectInput 手柄，可暂用 [Steam Input](https://partner.steamgames.com/doc/features/steam_controller/getting_started_for_players?l=english) 适配。
 - 主机平台、认证手柄透传、物理震动马达和灯光不在首版范围内；固件只接收并丢弃规范要求的震动输出报告。
 
 ## 默认 Apex 映射
@@ -56,9 +57,9 @@
 3. 输入处理、状态转换和发送路径保持 `no_std`、无堆分配、非阻塞。
 4. OTG1 忙时只保留最新完整手柄状态，不排队回放过期鼠标轨迹。
 5. 键盘或鼠标断开时立即释放其拥有的摇杆、按键和扳机状态；重新连接后自动恢复解析。
-6. OTG1 输入报告固定为 17 字节：Report ID 1、4 个无符号 16 位摇杆轴、两个 10 位扳机、Hat、15 个按钮和 Share；内部有符号摇杆中点转换为线上 `0x8000`，Hat 中立值转换为 0。
+6. 转换器同时保留两种编码：XInputHID 为固定 17 字节；临时 XUSB 为固定 20 字节，包含两个按键字节、两个 8 位扳机、四个有符号 16 位摇杆轴和 6 字节保留区。XUSB 的 Y 轴在编码时转换为 XInput 的“向上为正”。
 7. 固件不复用宏引擎，确保转换路径不执行宏配置。
-8. OTG1 提供 9 字节 Interrupt OUT 并接受 Report ID 2 的 XInputHID 震动报告，防止 Windows 驱动因输出路径缺失而降级；首版不驱动物理马达。
+8. XInputHID 模式提供 9 字节 Interrupt OUT；临时 XUSB 模式接受 8 字节震动/LED 输出命令。首版只接收并丢弃，不驱动物理马达或灯光。
 
 ## 验收标准
 
@@ -70,7 +71,7 @@
 
 ### PC 实机
 
-1. Windows 识别 `cafe:1053 / xense / RT1052 XInputHID Gamepad`，只出现一个 HID 手柄接口、一个 Interrupt IN 和一个 Interrupt OUT。
+1. 当前临时验证镜像在 Windows 识别为 `045e:028e / Xbox 360 Controller for Windows`，由系统 Xbox/XUSB 驱动接管，不再显示为通用 `HidUsb` 游戏手柄；恢复标准方案后再按 `cafe:1053` 的单 HID 接口重新验收。
 2. `tools/check-xinput.ps1` 至少报告一个 XInput slot；操作键鼠时 `XInputGetState` 中的四轴、按钮和两个扳机发生对应变化，中立值为四轴 0、Hat/按钮 0、扳机 0。
 3. WASD、鼠标、按键和滚轮逐项符合映射表；释放或拔出输入设备后不存在粘键、粘轴和粘扳机。
 4. 1 kHz 鼠标输入下连续运行 30 分钟，无缓冲越界、崩溃或过期轨迹回放。
@@ -78,7 +79,7 @@
 
 ## 暂不包含
 
-- 已弃用的 XUSB 协议、GIP 主机认证、无线手柄协议。
+- XUSB 作为最终发布协议、GIP/Xbox 主机认证、无线手柄协议；XUSB 仅作为当前 Windows PC 链路验证手段。
 - 物理 Force Feedback / rumble、LED、电量和音频端点。
 - 宏、Turbo、压枪曲线、武器识别、屏幕识别或网络控制自动化。
 - 游戏反作弊绕过、设备指纹伪装或隐藏物理输入来源。
@@ -99,4 +100,6 @@
 - 烧写前完整读取 32 MiB W25Q256，SHA-256 为 `530d9a9f5b5f9f519c6afbc84d6c2d95a38d88b166f1eab938bc62e9b6093e67`。
 - 第一版 XInputHID 镜像的 283 字节 Report Descriptor 超过 `usb-device` 的 256 字节复制式 EP0 缓冲；请求未完整返回，Windows 10 将 `USB\VID_CAFE&PID_1053` 标记为 Code 10 / `CM_PROB_FAILED_START`。
 - `RuntimeHid` 改为持有固件静态描述符，并通过 `accept_with_static` 在 EP0 上直接流式发送完整 283 字节。修正镜像仍为 88,096 字节，擦除两个 64 KiB 扇区；镜像与独立回读 SHA-256 均为 `e8d8cbb82c1e821abde39ce6a80c8805ab99886e51a415ac314f06fceaeaa0e5`，随后目标恢复运行。
-- Windows `XInputGetState` 和 Apex 训练场结果仍需在目标 PC 上完成最终确认。
+- 修正后 Windows 设备状态恢复为 `CM_PROB_NONE`，并成功创建 `HID-compliant game controller` 子设备；但仍由通用 `HidUsb` 接管，`XInputGetState` 的 0–3 槽位均为 `NO_XINPUT_CONTROLLER`。这证明剩余问题是 `xinputhid` 驱动绑定，而不是 HID 描述符传输。
+- 为先验证 XInput/Apex 链路，新增独立 `RuntimeXinput`，当前构建临时模拟 Xbox 360 有线控制器：四个 XUSB 接口、固定端点地址和 20 字节输入包。49 项主机单元测试与 RT1052 RAM/XIP 目标链接均通过。
+- 临时 XUSB 镜像为 88,096 字节，复用备份 SHA-256 `530d9a9f5b5f9f519c6afbc84d6c2d95a38d88b166f1eab938bc62e9b6093e67` 的板级启动头；擦除两个 64 KiB 扇区并写入 88,320 字节后，镜像与独立回读 SHA-256 均为 `614b8ac150f8fd46640543f120d72a57b74adaabae5af2bee0779853f45155c3`，目标随后恢复运行。Windows 枚举和 XInput 槽位仍待确认。

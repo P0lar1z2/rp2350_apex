@@ -228,6 +228,8 @@ pub struct GamepadReport {
 impl GamepadReport {
     /// Report ID plus sixteen bytes of XInputHID gamepad payload.
     pub const LEN: usize = 17;
+    /// Xbox 360 wired-controller input packet length.
+    pub const XUSB_LEN: usize = 20;
 
     pub const fn neutral() -> Self {
         Self {
@@ -261,6 +263,88 @@ impl GamepadReport {
         // input is mapped to Share in the Apex profile.
         bytes
     }
+
+    /// Encodes the same logical state as an Xbox 360 wired XUSB packet.
+    ///
+    /// This compatibility format is used only by the temporary Windows PC
+    /// validation firmware. XUSB uses positive Y for up, while the converter's
+    /// internal axes follow HID screen coordinates (positive Y is down).
+    pub fn encode_xusb(self) -> [u8; Self::XUSB_LEN] {
+        let mut bytes = [0u8; Self::XUSB_LEN];
+        bytes[0] = 0;
+        bytes[1] = Self::XUSB_LEN as u8;
+        bytes[2] = xusb_dpad(self.hat)
+            | if self.buttons & BUTTON_MENU != 0 {
+                1 << 4
+            } else {
+                0
+            }
+            | if self.buttons & BUTTON_VIEW != 0 {
+                1 << 5
+            } else {
+                0
+            }
+            | if self.buttons & BUTTON_LEFT_STICK != 0 {
+                1 << 6
+            } else {
+                0
+            }
+            | if self.buttons & BUTTON_RIGHT_STICK != 0 {
+                1 << 7
+            } else {
+                0
+            };
+        bytes[3] = if self.buttons & BUTTON_LEFT_SHOULDER != 0 {
+            1
+        } else {
+            0
+        } | if self.buttons & BUTTON_RIGHT_SHOULDER != 0 {
+            1 << 1
+        } else {
+            0
+        } | if self.buttons & BUTTON_SOUTH != 0 {
+            1 << 4
+        } else {
+            0
+        } | if self.buttons & BUTTON_EAST != 0 {
+            1 << 5
+        } else {
+            0
+        } | if self.buttons & BUTTON_WEST != 0 {
+            1 << 6
+        } else {
+            0
+        } | if self.buttons & BUTTON_NORTH != 0 {
+            1 << 7
+        } else {
+            0
+        };
+        bytes[4] = self.left_trigger;
+        bytes[5] = self.right_trigger;
+        bytes[6..8].copy_from_slice(&self.left_x.to_le_bytes());
+        bytes[8..10].copy_from_slice(&invert_xusb_y(self.left_y).to_le_bytes());
+        bytes[10..12].copy_from_slice(&self.right_x.to_le_bytes());
+        bytes[12..14].copy_from_slice(&invert_xusb_y(self.right_y).to_le_bytes());
+        bytes
+    }
+}
+
+const fn xusb_dpad(hat: u8) -> u8 {
+    match hat {
+        HAT_UP => 1 << 0,
+        HAT_UP_RIGHT => (1 << 0) | (1 << 3),
+        HAT_RIGHT => 1 << 3,
+        HAT_DOWN_RIGHT => (1 << 1) | (1 << 3),
+        HAT_DOWN => 1 << 1,
+        HAT_DOWN_LEFT => (1 << 1) | (1 << 2),
+        HAT_LEFT => 1 << 2,
+        HAT_UP_LEFT => (1 << 0) | (1 << 2),
+        _ => 0,
+    }
+}
+
+const fn invert_xusb_y(value: i16) -> i16 {
+    if value == i16::MIN { i16::MAX } else { -value }
 }
 
 const fn signed_axis_to_hid(value: i16) -> u16 {
@@ -573,6 +657,50 @@ mod tests {
         assert_eq!(report[13], 4);
         assert_eq!(u16::from_le_bytes([report[14], report[15]]), 0x7fff);
         assert_eq!(report[16], 0);
+    }
+
+    #[test]
+    fn xusb_wire_layout_maps_buttons_axes_triggers_and_dpad() {
+        let report = GamepadReport {
+            left_x: -12_345,
+            left_y: -23_456,
+            right_x: 12_345,
+            right_y: 23_456,
+            buttons: BUTTON_SOUTH
+                | BUTTON_EAST
+                | BUTTON_WEST
+                | BUTTON_NORTH
+                | BUTTON_LEFT_SHOULDER
+                | BUTTON_RIGHT_SHOULDER
+                | BUTTON_VIEW
+                | BUTTON_MENU
+                | BUTTON_LEFT_STICK
+                | BUTTON_RIGHT_STICK,
+            hat: HAT_DOWN_RIGHT,
+            left_trigger: 17,
+            right_trigger: 231,
+        }
+        .encode_xusb();
+
+        assert_eq!(report[0..6], [0, 20, 0xfa, 0xf3, 17, 231]);
+        assert_eq!(i16::from_le_bytes([report[6], report[7]]), -12_345);
+        assert_eq!(i16::from_le_bytes([report[8], report[9]]), 23_456);
+        assert_eq!(i16::from_le_bytes([report[10], report[11]]), 12_345);
+        assert_eq!(i16::from_le_bytes([report[12], report[13]]), -23_456);
+        assert_eq!(report[14..], [0; 6]);
+    }
+
+    #[test]
+    fn xusb_neutral_and_wasd_y_use_xinput_polarity() {
+        assert_eq!(
+            GamepadReport::neutral().encode_xusb(),
+            [0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+
+        let mut converter = KbmToGamepad::new(APEX_DEFAULT_CONFIG);
+        converter.observe_keyboard(keyboard(&[KEY_W], 0));
+        let report = converter.report().encode_xusb();
+        assert_eq!(i16::from_le_bytes([report[8], report[9]]), i16::MAX);
     }
 
     #[test]

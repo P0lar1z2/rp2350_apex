@@ -8,13 +8,12 @@ use imxrt_ral as ral;
 use imxrt_usbd::{BusAdapter, EndpointMemory, EndpointState, Instances, Speed};
 use panic_rtt_target as _;
 use rt1052_bringup::{
-    gamepad_converter::{
-        APEX_DEFAULT_CONFIG, GAMEPAD_REPORT_DESCRIPTOR, GamepadReport, KbmToGamepad,
-    },
+    gamepad_converter::{APEX_DEFAULT_CONFIG, GamepadReport, KbmToGamepad},
     hid_report::{
         DecodedReport, KeyboardState, MouseState, ReportDecoder, parse_report_descriptor,
     },
-    runtime_hid::{MAX_HID_INTERFACES, RuntimeHid},
+    runtime_hid::MAX_HID_INTERFACES,
+    runtime_xinput::RuntimeXinput,
 };
 use rtt_target::{ChannelMode::NoBlockSkip, rprintln, rtt_init_print};
 use usb_device::{
@@ -37,11 +36,11 @@ const GAMEPAD_KEEPALIVE_US: u32 = 1_000;
 const CAP_KEYBOARD: u8 = 1 << 0;
 const CAP_MOUSE: u8 = 1 << 1;
 
-// Development-only placeholder. A distributed product needs an assigned VID/PID.
-const GAMEPAD_VID: u16 = 0xcafe;
-// Use a new development PID so Windows does not reuse the old DirectInput-only
-// device node after the report descriptor changes to the XInputHID profile.
-const GAMEPAD_PID: u16 = 0x1053;
+// Temporary Windows PC compatibility validation identity. Do not distribute a
+// product with Microsoft's VID/PID; the final device needs assigned IDs and the
+// standards-based XInputHID binding path retained elsewhere in this project.
+const GAMEPAD_VID: u16 = 0x045e;
+const GAMEPAD_PID: u16 = 0x028e;
 
 #[unsafe(link_section = ".usb_device.endpoint_memory")]
 static EP_MEMORY: EndpointMemory<2048> = EndpointMemory::new();
@@ -472,26 +471,20 @@ fn main() -> ! {
         &EP_STATE,
         Speed::LowFull,
     ));
-    let neutral_report = GamepadReport::neutral().encode();
-    let mut hid = RuntimeHid::new_bidirectional(
-        &bus,
-        GAMEPAD_REPORT_DESCRIPTOR,
-        GamepadReport::LEN as u16,
-        1,
-        9,
-        1,
-        0,
-        0,
-    );
-    hid.set_input_report(&neutral_report);
+    let neutral_report = GamepadReport::neutral().encode_xusb();
+    let mut xinput = RuntimeXinput::new(&bus);
     let strings = [StringDescriptors::new(LangID::from(0x0409))
-        .manufacturer("xense")
-        .product("RT1052 XInputHID Gamepad")
-        .serial_number("XENSE-XINPUTHID-0001")];
+        .manufacturer("Microsoft Corporation")
+        .product("Controller")
+        .serial_number("XENSE-XUSB-0001")];
     let mut device = UsbDeviceBuilder::new(&bus, UsbVidPid(GAMEPAD_VID, GAMEPAD_PID))
         .usb_rev(UsbRev::Usb200)
-        .device_release(0x0200)
-        .max_power(100)
+        .device_class(0xff)
+        .device_sub_class(0xff)
+        .device_protocol(0xff)
+        .device_release(0x0114)
+        .supports_remote_wakeup(true)
+        .max_power(500)
         .expect("gamepad USB power is valid")
         .max_packet_size_0(64)
         .expect("64-byte EP0 is valid")
@@ -507,8 +500,8 @@ fn main() -> ! {
     let mut forwarded = 0u32;
     let mut send_errors = 0u32;
     rprintln!(
-        "gamepad bridge running: report={} bytes interval=1 ms VID:PID={:04x}:{:04x}",
-        GamepadReport::LEN,
+        "gamepad bridge running: XUSB report={} bytes interval=1 ms VID:PID={:04x}:{:04x}",
+        GamepadReport::XUSB_LEN,
         GAMEPAD_VID,
         GAMEPAD_PID
     );
@@ -516,7 +509,7 @@ fn main() -> ! {
     loop {
         // SAFETY: Main-loop-only service of the initialized USB2 host stack.
         unsafe { nxp_host_task() };
-        let _ = device.poll(&mut [&mut hid]);
+        let _ = device.poll(&mut [&mut xinput]);
         if device.state() == UsbDeviceState::Configured {
             if !device_configured {
                 device.bus().configure();
@@ -650,10 +643,10 @@ fn main() -> ! {
         let now = clock.now_us();
         converter.tick(now);
         let desired_state = converter.report();
-        let desired = desired_state.encode();
+        let desired = desired_state.encode_xusb();
         let keepalive_due = now.wrapping_sub(last_sent_at) >= GAMEPAD_KEEPALIVE_US;
         if device_configured && (!last_sent_valid || desired != last_sent || keepalive_due) {
-            match hid.push_report(&desired) {
+            match xinput.push_report(&desired) {
                 Ok(_) => {
                     last_sent = desired;
                     last_sent_valid = true;

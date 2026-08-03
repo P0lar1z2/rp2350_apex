@@ -16,7 +16,9 @@ boot-image, programming, and readback-verification flow is also available.
 - `enet_dma_probe`: initializes five RX and three TX descriptors in non-cacheable
   OCRAM, then polls raw frames without an RTOS.
 - `gamepad_bridge`: converts an OTG2 keyboard and mouse into one fixed OTG1
-  Microsoft XInputHID-compatible gamepad. See
+  gamepad. The current Windows validation build temporarily uses the legacy
+  Xbox 360 XUSB device layout; the standards-based XInputHID implementation is
+  retained for the final driver-binding path. See
   [`GAMEPAD_CONVERTER.md`](../GAMEPAD_CONVERTER.md) for the Apex-oriented
   mapping, limits, and hardware acceptance plan.
 

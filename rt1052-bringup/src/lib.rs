@@ -24,6 +24,9 @@ pub mod hid_device;
 pub mod runtime_hid;
 
 #[cfg(feature = "nxp-device")]
+pub mod runtime_xinput;
+
+#[cfg(feature = "nxp-device")]
 #[path = "../../src/macro_engine.rs"]
 pub mod macro_engine;
 
