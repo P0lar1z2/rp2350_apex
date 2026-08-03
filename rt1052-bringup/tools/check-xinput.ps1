@@ -1,7 +1,7 @@
 param(
     [switch]$Once,
-    [ValidateRange(20, 5000)]
-    [int]$IntervalMs = 100
+    [ValidateRange(1, 5000)]
+    [int]$IntervalMs = 10
 )
 
 $ErrorActionPreference = "Stop"
