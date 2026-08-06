@@ -15,6 +15,10 @@ boot-image, programming, and readback-verification flow is also available.
 - `enet_probe`: reads the Pro board's LAN8720A identity and link state over MDIO.
 - `enet_dma_probe`: initializes five RX and three TX descriptors in non-cacheable
   OCRAM, then polls raw frames without an RTOS.
+- `hid_bridge`: clones all downstream HID interfaces from OTG2 to OTG1, keeps
+  physical mouse movement unmodified, and replays the 30-shot R-301
+  compensation trajectory while the physical left button is held. It obtains
+  a DHCP lease and accepts runtime sensitivity changes over UDP port 1052.
 
 ## Build
 
@@ -22,6 +26,8 @@ boot-image, programming, and readback-verification flow is also available.
 cargo build --bin host_probe
 cargo build --features nxp-host --bin host_enumerate
 cargo build --features nxp-enet --bin enet_dma_probe
+cargo build --release --features nxp-host,nxp-device,nxp-enet,flash-xip \
+  --bin hid_bridge
 ```
 
 The NXP build needs the locally ignored `.vendor/` tree documented in
@@ -89,9 +95,10 @@ the `flash` command stops after backup and image creation. Keep at least one
 full backup outside the repository before programming. The workflow does not
 burn eFuses and does not perform a whole-chip erase.
 
-Hardware verification programmed 108,576 image bytes after erasing two 64 KiB
-sectors. The complete programmed range matched its SHA-256 readback, then an
-NRST boot enumerated the five-interface `RT1052 Composite HID Clone` on OTG1.
+A previous clone-only build was hardware-verified after programming 108,576
+image bytes and checking its SHA-256 readback; NRST then enumerated the
+five-interface `RT1052 Composite HID Clone` on OTG1. The combined clone,
+trajectory, and ENET image described below still requires hardware validation.
 
 The intended wiring is OTG2 to the board's FE1.1S hub and mouse, while OTG1 is
 connected to the PC. `host_enumerate` only exercises OTG2.
@@ -107,8 +114,9 @@ source, so this path has a 1 ms / 1 kHz ceiling; it must not be advertised as
 The Pro board PHY responds at MDIO address 0 with ID `0007:c0f1`, identifying a
 LAN8720A. ENET DMA initialization and the 5 RX / 3 TX descriptor layout have
 been verified in RAM. The control plane uses a small allocation-free `RTCP` v1
-datagram format and a bounded queue: network congestion may drop a command or
-ACK, but it never blocks the USB data path.
+datagram format. The bridge validates and applies sensitivity commands from its
+main polling loop, outside USB and ENET interrupt paths; network congestion may
+drop a command or ACK, but it never blocks HID forwarding.
 
 `enet_control` obtains its IPv4 configuration through DHCP and binds UDP port
 1052 only after a lease is configured. Its locally administered MAC address is
@@ -118,3 +126,24 @@ raise the core/AHB clock to 528 MHz and IPG to 132 MHz before starting ENET;
 with the Boot ROM's low-speed clock tree, 10M works but 100M frames are
 corrupted. With the RUN clock configured, the PHY-local 100M loopback is
 byte-exact and the external link negotiates 100M Full-Duplex.
+
+## Runtime recoil sensitivity
+
+The bridge starts at game sensitivity `1.000`. The checked-in trajectory was
+calibrated at that value; changing sensitivity divides only generated recoil
+movement by the requested value. Physical mouse X/Y reports remain 1:1 and the
+real left button remains visible to the PC.
+
+After RTT prints the DHCP address, set sensitivity from this repository with
+the standard-library-only Python client:
+
+```sh
+python rt1052-bringup/tools/rtcp_control.py \
+  192.168.110.123 sensitivity 1.5
+```
+
+Valid values are `0.100` through `10.000`. The client retries a lost UDP packet
+and succeeds only after receiving a matching RTCP ACK. The combined clone,
+trajectory, and ENET image exceeds the RT1052's 128 KiB RAM-only ITCM region,
+so `hid_bridge` must currently be built with `flash-xip` and installed through
+the guarded FlexSPI workflow above.

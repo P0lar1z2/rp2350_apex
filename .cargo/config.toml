@@ -61,10 +61,9 @@ rustflags = [
 ]
 
 # i.MX RT1052 Cortex-M7 RAM images. Keep this entry in the workspace-level
-# config as well as rt1052-bringup/.cargo/config.toml: Cargo discovers config
-# from the invocation directory, so `cargo --manifest-path rt1052-bringup/...`
-# run at the repository root would otherwise omit link.x and silently emit an
-# ELF with entry point 0 and no executable sections.
+# config. Cargo merges ancestor and crate-local configs, so link.x must be
+# specified only here; duplicating it in rt1052-bringup/.cargo/config.toml
+# makes the linker include memory.x twice.
 [target.thumbv7em-none-eabihf]
 rustflags = [
     "-C", "link-arg=-Tlink.x",

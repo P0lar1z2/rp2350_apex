@@ -7,6 +7,9 @@ pub const MAGIC: [u8; 4] = *b"RTCP";
 pub const VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 12;
 pub const MAX_PAYLOAD_LEN: usize = 16;
+pub const SET_SENSITIVITY_KIND: u8 = 6;
+pub const MIN_SENSITIVITY_MILLI: u16 = 100;
+pub const MAX_SENSITIVITY_MILLI: u16 = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlCommand {
@@ -15,6 +18,9 @@ pub enum ControlCommand {
     TriggerProgram(u8),
     ReleaseProgram(u8),
     EmergencyRelease,
+    /// In-game sensitivity in thousandths. The recoil trajectory is calibrated
+    /// at 1.000 and physical mouse movement is never scaled.
+    SetSensitivityMilli(u16),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,7 +123,14 @@ pub fn decode(packet: &[u8]) -> Result<CommandFrame, DecodeError> {
         (3, [program]) => ControlCommand::TriggerProgram(*program),
         (4, [program]) => ControlCommand::ReleaseProgram(*program),
         (5, []) => ControlCommand::EmergencyRelease,
-        (1..=5, _) => return Err(DecodeError::BadPayload),
+        (SET_SENSITIVITY_KIND, [low, high]) => {
+            let sensitivity = u16::from_le_bytes([*low, *high]);
+            if !(MIN_SENSITIVITY_MILLI..=MAX_SENSITIVITY_MILLI).contains(&sensitivity) {
+                return Err(DecodeError::BadPayload);
+            }
+            ControlCommand::SetSensitivityMilli(sensitivity)
+        }
+        (1..=SET_SENSITIVITY_KIND, _) => return Err(DecodeError::BadPayload),
         _ => return Err(DecodeError::UnknownKind),
     };
     Ok(CommandFrame { sequence, command })
@@ -172,12 +185,20 @@ mod tests {
             (3, &[7][..], ControlCommand::TriggerProgram(7)),
             (4, &[7][..], ControlCommand::ReleaseProgram(7)),
             (5, &[][..], ControlCommand::EmergencyRelease),
+            (
+                SET_SENSITIVITY_KIND,
+                &1_500u16.to_le_bytes()[..],
+                ControlCommand::SetSensitivityMilli(1_500),
+            ),
         ];
         for (kind, payload, expected) in cases {
             let packet = command(kind, 0x1234_5678, payload);
             assert_eq!(
                 decode(&packet[..HEADER_LEN + payload.len()]),
-                Ok(CommandFrame { sequence: 0x1234_5678, command: expected })
+                Ok(CommandFrame {
+                    sequence: 0x1234_5678,
+                    command: expected
+                })
             );
         }
     }
@@ -188,6 +209,10 @@ mod tests {
         assert_eq!(decode(&packet[..13]), Err(DecodeError::BadPayload));
         let packet = command(5, 1, &[]);
         assert_eq!(decode(&packet[..13]), Err(DecodeError::BadLength));
+        let packet = command(SET_SENSITIVITY_KIND, 1, &99u16.to_le_bytes());
+        assert_eq!(decode(&packet[..14]), Err(DecodeError::BadPayload));
+        let packet = command(SET_SENSITIVITY_KIND, 1, &10_001u16.to_le_bytes());
+        assert_eq!(decode(&packet[..14]), Err(DecodeError::BadPayload));
     }
 
     #[test]
@@ -204,9 +229,18 @@ mod tests {
     #[test]
     fn bounded_queue_never_blocks_and_preserves_order() {
         let mut queue = ControlQueue::<2>::new();
-        let first = CommandFrame { sequence: 1, command: ControlCommand::SelectLayer(2) };
-        let second = CommandFrame { sequence: 2, command: ControlCommand::TriggerProgram(4) };
-        let overflow = CommandFrame { sequence: 3, command: ControlCommand::EmergencyRelease };
+        let first = CommandFrame {
+            sequence: 1,
+            command: ControlCommand::SelectLayer(2),
+        };
+        let second = CommandFrame {
+            sequence: 2,
+            command: ControlCommand::TriggerProgram(4),
+        };
+        let overflow = CommandFrame {
+            sequence: 3,
+            command: ControlCommand::EmergencyRelease,
+        };
         assert_eq!(queue.push(first), Ok(()));
         assert_eq!(queue.push(second), Ok(()));
         assert_eq!(queue.push(overflow), Err(overflow));

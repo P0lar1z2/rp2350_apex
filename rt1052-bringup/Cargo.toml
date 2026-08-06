@@ -61,7 +61,7 @@ required-features = ["nxp-host", "nxp-device"]
 [[bin]]
 name = "hid_bridge"
 path = "src/bin/hid_bridge.rs"
-required-features = ["nxp-host", "nxp-device"]
+required-features = ["nxp-host", "nxp-device", "nxp-enet"]
 
 [profile.dev]
 opt-level = 2

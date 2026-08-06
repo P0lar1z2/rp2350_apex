@@ -5,6 +5,9 @@ use crate::usb_host::{DecodedReport, KeyboardState};
 pub const MAX_LAYERS: usize = 8;
 pub const MAX_PROGRAMS: usize = 16;
 pub const MAX_LOOP_DEPTH: usize = 4;
+pub const DEFAULT_GAME_SENSITIVITY_MILLI: u16 = 1_000;
+pub const MIN_GAME_SENSITIVITY_MILLI: u16 = 100;
+pub const MAX_GAME_SENSITIVITY_MILLI: u16 = 10_000;
 
 const EMPTY_STEPS: &[Step] = &[];
 
@@ -336,6 +339,9 @@ pub struct MacroEngine {
     pending_y: i16,
     pending_wheel: i16,
     pending_pan: i16,
+    game_sensitivity_milli: u16,
+    sensitivity_remainder_x: i32,
+    sensitivity_remainder_y: i32,
     last_queued_buttons: u8,
     last_queued_keyboard: KeyboardState,
 }
@@ -354,6 +360,9 @@ impl MacroEngine {
             pending_y: 0,
             pending_wheel: 0,
             pending_pan: 0,
+            game_sensitivity_milli: DEFAULT_GAME_SENSITIVITY_MILLI,
+            sensitivity_remainder_x: 0,
+            sensitivity_remainder_y: 0,
             last_queued_buttons: 0,
             last_queued_keyboard: KeyboardState::empty(),
         };
@@ -361,6 +370,23 @@ impl MacroEngine {
             engine.layer_enabled[index] = layer.default_enabled;
         }
         engine
+    }
+
+    /// Set the in-game mouse sensitivity used to scale generated recoil
+    /// motion. Physical mouse reports remain untouched. The stored trajectory
+    /// is calibrated at 1.000, so generated counts are divided by this value.
+    pub fn set_game_sensitivity_milli(&mut self, sensitivity_milli: u16) -> bool {
+        if !(MIN_GAME_SENSITIVITY_MILLI..=MAX_GAME_SENSITIVITY_MILLI).contains(&sensitivity_milli) {
+            return false;
+        }
+        self.game_sensitivity_milli = sensitivity_milli;
+        self.sensitivity_remainder_x = 0;
+        self.sensitivity_remainder_y = 0;
+        true
+    }
+
+    pub const fn game_sensitivity_milli(&self) -> u16 {
+        self.game_sensitivity_milli
     }
 
     /// Observe a physical report, update triggers, apply masks, and merge
@@ -405,6 +431,9 @@ impl MacroEngine {
                         &mut self.pending_y,
                         &mut self.pending_wheel,
                         &mut self.pending_pan,
+                        self.game_sensitivity_milli,
+                        &mut self.sensitivity_remainder_x,
+                        &mut self.sensitivity_remainder_y,
                     );
                 }
                 program_index += 1;
@@ -585,6 +614,9 @@ fn run_program(
     pending_y: &mut i16,
     pending_wheel: &mut i16,
     pending_pan: &mut i16,
+    game_sensitivity_milli: u16,
+    sensitivity_remainder_x: &mut i32,
+    sensitivity_remainder_y: &mut i32,
 ) {
     if !state.running || state.depth == 0 {
         return;
@@ -637,8 +669,18 @@ fn run_program(
             Step::MouseDown(buttons) => state.owned_buttons |= buttons,
             Step::MouseUp(buttons) => state.owned_buttons &= !buttons,
             Step::MouseMove { x, y } => {
-                *pending_x = pending_x.saturating_add(rng.i16(x));
-                *pending_y = pending_y.saturating_add(rng.i16(y));
+                let x = scale_for_game_sensitivity(
+                    rng.i16(x),
+                    game_sensitivity_milli,
+                    sensitivity_remainder_x,
+                );
+                let y = scale_for_game_sensitivity(
+                    rng.i16(y),
+                    game_sensitivity_milli,
+                    sensitivity_remainder_y,
+                );
+                *pending_x = pending_x.saturating_add(x);
+                *pending_y = pending_y.saturating_add(y);
             }
             Step::MouseWheel { vertical, pan } => {
                 *pending_wheel = pending_wheel.saturating_add(rng.i16(vertical));
@@ -652,6 +694,16 @@ fn run_program(
             }
         }
     }
+}
+
+fn scale_for_game_sensitivity(value: i16, sensitivity_milli: u16, remainder: &mut i32) -> i16 {
+    let numerator = i32::from(value)
+        .saturating_mul(i32::from(DEFAULT_GAME_SENSITIVITY_MILLI))
+        .saturating_add(*remainder);
+    let denominator = i32::from(sensitivity_milli.max(1));
+    let scaled = numerator / denominator;
+    *remainder = numerator % denominator;
+    scaled.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
 }
 
 fn set_owned_key(state: &mut ProgramState, usage: u8, down: bool) {
@@ -815,6 +867,62 @@ mod tests {
             assert!((10..=20).contains(&delay));
             assert_eq!(delay, second.u16(RandomU16::Uniform { min: 10, max: 20 }));
         }
+    }
+
+    #[test]
+    fn sensitivity_scaling_preserves_fractional_motion() {
+        let mut remainder = 0;
+        let scaled: [i16; 3] =
+            core::array::from_fn(|_| scale_for_game_sensitivity(1, 1_500, &mut remainder));
+        assert_eq!(scaled, [0, 1, 1]);
+        assert_eq!(remainder, 0);
+
+        let mut remainder = 0;
+        let scaled: [i16; 3] =
+            core::array::from_fn(|_| scale_for_game_sensitivity(-1, 1_500, &mut remainder));
+        assert_eq!(scaled, [0, -1, -1]);
+        assert_eq!(remainder, 0);
+    }
+
+    #[test]
+    fn sensitivity_setting_is_bounded_and_resets_fractional_state() {
+        let mut engine = MacroEngine::new(&CONFIG, 1);
+        engine.sensitivity_remainder_x = 12;
+        engine.sensitivity_remainder_y = -9;
+        assert!(engine.set_game_sensitivity_milli(1_500));
+        assert_eq!(engine.game_sensitivity_milli(), 1_500);
+        assert_eq!(engine.sensitivity_remainder_x, 0);
+        assert_eq!(engine.sensitivity_remainder_y, 0);
+        assert!(!engine.set_game_sensitivity_milli(99));
+        assert!(!engine.set_game_sensitivity_milli(10_001));
+        assert_eq!(engine.game_sensitivity_milli(), 1_500);
+    }
+
+    #[test]
+    fn checked_in_config_is_only_left_button_recoil() {
+        let config = &crate::macro_config::CONFIG;
+        assert!(config.always_mask.is_empty());
+        assert_eq!(config.layers.len(), 1);
+        let layer = &config.layers[0];
+        assert!(layer.default_enabled);
+        assert_eq!(layer.activation, None);
+        assert_eq!(layer.programs.len(), 1);
+        let program = &layer.programs[0];
+        assert_eq!(program.trigger.chord, &[Input::MouseButton(1)]);
+        assert_eq!(program.trigger.behavior, TriggerBehavior::Hold);
+        assert_eq!(program.trigger.mask, Mask::None);
+        assert_eq!(program.repeat, Repeat::Once);
+        assert_eq!(program.alternate_steps, None);
+        assert!(!program.alternate_on_repeat);
+        assert!(
+            program
+                .steps
+                .iter()
+                .all(|step| matches!(step, Step::WaitMs(_) | Step::MouseMove { .. }))
+        );
+
+        let mut engine = MacroEngine::new(config, 1);
+        assert_eq!(engine.observe(mouse(1)), mouse(1));
     }
 
     #[test]

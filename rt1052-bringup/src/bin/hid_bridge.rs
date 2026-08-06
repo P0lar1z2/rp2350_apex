@@ -8,16 +8,24 @@ use imxrt_ral as ral;
 use imxrt_usbd::{BusAdapter, EndpointMemory, EndpointState, Instances};
 use panic_rtt_target as _;
 use rt1052_bringup::{
+    control_protocol::{self, ControlCommand},
+    enet_device::EnetDevice,
     hid_report::{
         DecodedReport, KeyboardState, MouseState, ReportDecoder, parse_report_descriptor,
     },
     macro_config::CONFIG as MACRO_CONFIG,
-    macro_engine::{MacroEngine, MacroMouseReport},
+    macro_engine::{DEFAULT_GAME_SENSITIVITY_MILLI, MacroEngine, MacroMouseReport},
     runtime_hid::{
         MAX_HID_INTERFACES, RuntimeCompositeHid, RuntimeHidInterface, high_speed_interval,
     },
 };
 use rtt_target::{ChannelMode::NoBlockSkip, rprintln, rtt_init_print};
+use smoltcp::{
+    iface::{Config as NetworkConfig, Interface, SocketHandle, SocketSet, SocketStorage},
+    socket::{dhcpv4, udp},
+    time::Instant,
+    wire::{EthernetAddress, IpCidr},
+};
 use usb_device::{
     UsbError,
     bus::UsbBusAllocator,
@@ -34,6 +42,9 @@ const DWT_CTRL: usize = 0xE000_1000;
 const DWT_CYCCNT: usize = 0xE000_1004;
 const USB1_USBCMD: usize = 0x402E_0140;
 const SOURCE_PROFILE_SETTLE_US: u32 = 1_000_000;
+const CONTROL_UDP_PORT: u16 = 1052;
+const ACK_OK: u8 = 0;
+const ACK_UNSUPPORTED: u8 = 1;
 
 #[unsafe(link_section = ".usb_device.endpoint_memory")]
 static EP_MEMORY: EndpointMemory<2048> = EndpointMemory::new();
@@ -158,6 +169,82 @@ impl CycleClock {
     }
 }
 
+fn service_control_endpoint(
+    interface: &mut Interface,
+    enet: &mut EnetDevice,
+    sockets: &mut SocketSet<'_>,
+    dhcp_handle: SocketHandle,
+    udp_handle: SocketHandle,
+    now_us: u32,
+) -> Option<u16> {
+    let now = Instant::from_millis(i64::from(now_us / 1_000));
+    let _ = interface.poll(now, enet, sockets);
+
+    match sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll() {
+        Some(dhcpv4::Event::Configured(config)) => {
+            interface.update_ip_addrs(|addresses| {
+                addresses.clear();
+                addresses.push(IpCidr::Ipv4(config.address)).unwrap();
+            });
+            if let Some(router) = config.router {
+                let _ = interface.routes_mut().add_default_ipv4_route(router);
+            } else {
+                interface.routes_mut().remove_default_ipv4_route();
+            }
+            rprintln!(
+                "READY: DHCP IP={} gateway={:?} RTCP UDP {}",
+                config.address,
+                config.router,
+                CONTROL_UDP_PORT
+            );
+        }
+        Some(dhcpv4::Event::Deconfigured) => {
+            interface.update_ip_addrs(|addresses| addresses.clear());
+            interface.routes_mut().remove_default_ipv4_route();
+            rprintln!("DHCP lease lost; RTCP inactive");
+        }
+        None => {}
+    }
+
+    let socket = sockets.get_mut::<udp::Socket>(udp_handle);
+    if !socket.can_recv() {
+        return None;
+    }
+    let mut datagram = [0u8; control_protocol::HEADER_LEN + control_protocol::MAX_PAYLOAD_LEN];
+    let Ok((length, remote)) = socket.recv_slice(&mut datagram) else {
+        return None;
+    };
+    let Ok(frame) = control_protocol::decode(&datagram[..length]) else {
+        rprintln!("RTCP rejected malformed datagram len={}", length);
+        return None;
+    };
+    let (status, sensitivity) = match frame.command {
+        ControlCommand::SetSensitivityMilli(value) => (ACK_OK, Some(value)),
+        _ => (ACK_UNSUPPORTED, None),
+    };
+    let mut ack = [0u8; 16];
+    if let Ok(ack_len) = control_protocol::encode_ack(&mut ack, frame.sequence, datagram[5], status)
+        && socket.can_send()
+    {
+        let _ = socket.send_slice(&ack[..ack_len], remote.endpoint);
+    }
+    if let Some(value) = sensitivity {
+        rprintln!(
+            "RTCP seq={} sensitivity={}.{:03}",
+            frame.sequence,
+            value / 1_000,
+            value % 1_000
+        );
+    } else {
+        rprintln!(
+            "RTCP seq={} unsupported command={:?}",
+            frame.sequence,
+            frame.command
+        );
+    }
+    sensitivity
+}
+
 fn merge_mouse(physical: MouseState, generated: MacroMouseReport) -> MouseState {
     MouseState {
         buttons: generated.buttons,
@@ -254,6 +341,29 @@ fn main() -> ! {
         peripherals.SCB.disable_dcache(&mut peripherals.CPUID);
     }
 
+    let mut enet = match EnetDevice::new() {
+        Ok(enet) => enet,
+        Err(error) => {
+            rprintln!("ERROR: ENET init={}", error);
+            loop {
+                cortex_m::asm::nop();
+            }
+        }
+    };
+    let enet_status = enet.status().unwrap_or_default();
+    rprintln!(
+        "ENET PHY {:04x}:{:04x} link={} {}M {} duplex",
+        enet_status.phy_id1,
+        enet_status.phy_id2,
+        enet_status.link_up,
+        if enet_status.speed_100m != 0 { 100 } else { 10 },
+        if enet_status.full_duplex != 0 {
+            "full"
+        } else {
+            "half"
+        }
+    );
+
     write32(USB_OTG2_VECTOR, usb_otg2_irq as *const () as usize as u32);
     // SAFETY: USB2 is exclusively owned by the NXP Host stack.
     let host_status = unsafe { nxp_host_init() };
@@ -273,6 +383,28 @@ fn main() -> ! {
 
     let core_hz = unsafe { nxp_core_clock_hz() };
     let mut clock = CycleClock::new(core_hz);
+    let mac = EthernetAddress([0x02, 0x10, 0x52, 0x00, 0x00, 0x01]);
+    let mut network_config = NetworkConfig::new(mac.into());
+    network_config.random_seed = 0x1052_0001;
+    let network_now = Instant::from_millis(i64::from(clock.now_us() / 1_000));
+    let mut network = Interface::new(network_config, &mut enet, network_now);
+    let mut udp_rx_meta = [udp::PacketMetadata::EMPTY; 4];
+    let mut udp_rx_data = [0u8; 256];
+    let mut udp_tx_meta = [udp::PacketMetadata::EMPTY; 4];
+    let mut udp_tx_data = [0u8; 256];
+    let udp_rx_buffer = udp::PacketBuffer::new(&mut udp_rx_meta[..], &mut udp_rx_data[..]);
+    let udp_tx_buffer = udp::PacketBuffer::new(&mut udp_tx_meta[..], &mut udp_tx_data[..]);
+    let mut udp_socket = udp::Socket::new(udp_rx_buffer, udp_tx_buffer);
+    udp_socket.bind(CONTROL_UDP_PORT).unwrap();
+    let mut socket_storage = [SocketStorage::EMPTY; 2];
+    let mut sockets = SocketSet::new(&mut socket_storage[..]);
+    let udp_handle = sockets.add(udp_socket);
+    let dhcp_handle = sockets.add(dhcpv4::Socket::new());
+    let mut requested_sensitivity_milli = DEFAULT_GAME_SENSITIVITY_MILLI;
+    rprintln!(
+        "DHCP discovering; RTCP sensitivity control UDP {}",
+        CONTROL_UDP_PORT
+    );
     rprintln!("waiting for OTG2 keyboard and mouse profiles before attaching OTG1");
     let mut sources = [HostEvent::empty(); MAX_HID_INTERFACES];
     let mut report_descriptors = [[0u8; 512]; MAX_HID_INTERFACES];
@@ -282,6 +414,16 @@ fn main() -> ! {
     let mut source_roles_ready = false;
     let mut profile_stable_since = clock.now_us();
     'profile: loop {
+        if let Some(value) = service_control_endpoint(
+            &mut network,
+            &mut enet,
+            &mut sockets,
+            dhcp_handle,
+            udp_handle,
+            clock.now_us(),
+        ) {
+            requested_sensitivity_milli = value;
+        }
         // SAFETY: Called only from this main loop; USB2 IRQ handles controller events.
         unsafe { nxp_host_task() };
         let mut event = HostEvent::empty();
@@ -508,11 +650,14 @@ fn main() -> ! {
     }
     let macro_seed = u64::from(core_hz) ^ (u64::from(identity.vid) << 32) ^ u64::from(identity.pid);
     let mut macro_engine = MacroEngine::new(&MACRO_CONFIG, macro_seed);
+    let _ = macro_engine.set_game_sensitivity_milli(requested_sensitivity_milli);
     rprintln!(
-        "macro engine ready: core={} Hz keyboard={:?} mouse={:?}",
+        "macro engine ready: core={} Hz keyboard={:?} mouse={:?} sensitivity={}.{:03}",
         core_hz,
         keyboard_interface,
-        mouse_interface
+        mouse_interface,
+        requested_sensitivity_milli / 1_000,
+        requested_sensitivity_milli % 1_000
     );
     let mut device_configured = false;
     let mut forwarded = [0u32; MAX_HID_INTERFACES];
@@ -537,6 +682,17 @@ fn main() -> ! {
     let mut reconnect_descriptor = [0u8; 512];
 
     loop {
+        if let Some(value) = service_control_endpoint(
+            &mut network,
+            &mut enet,
+            &mut sockets,
+            dhcp_handle,
+            udp_handle,
+            clock.now_us(),
+        ) {
+            requested_sensitivity_milli = value;
+            let _ = macro_engine.set_game_sensitivity_milli(value);
+        }
         // SAFETY: Called only from this main loop; USB2 IRQ handles controller events.
         unsafe { nxp_host_task() };
         let _ = device.poll(&mut [&mut hid]);
@@ -648,6 +804,8 @@ fn main() -> ! {
                         device_configured = false;
                         pending_ready.fill(false);
                         macro_engine = MacroEngine::new(&MACRO_CONFIG, macro_seed);
+                        let _ =
+                            macro_engine.set_game_sensitivity_milli(requested_sensitivity_milli);
                         rprintln!(
                             "OTG2 HID[{}] profile {:?} detached; OTG1 disconnected from PC",
                             event.interface_index,

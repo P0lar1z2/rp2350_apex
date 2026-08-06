@@ -180,7 +180,7 @@ def build_image(args: argparse.Namespace, backup_path: Path) -> Path:
             "--target",
             "thumbv7em-none-eabihf",
             "--features",
-            "nxp-host,nxp-device,flash-xip",
+            "nxp-host,nxp-device,nxp-enet,flash-xip",
             "--bin",
             "hid_bridge",
         ]
