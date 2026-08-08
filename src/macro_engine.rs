@@ -331,6 +331,8 @@ pub struct MacroEngine {
     config: &'static Config,
     keyboard: KeyboardState,
     physical_mouse_buttons: u8,
+    remote_keyboard: KeyboardState,
+    remote_mouse_buttons: u8,
     layer_enabled: [bool; MAX_LAYERS],
     activation_was_down: [bool; MAX_LAYERS],
     programs: [ProgramState; MAX_PROGRAMS],
@@ -352,6 +354,8 @@ impl MacroEngine {
             config,
             keyboard: KeyboardState::empty(),
             physical_mouse_buttons: 0,
+            remote_keyboard: KeyboardState::empty(),
+            remote_mouse_buttons: 0,
             layer_enabled: [false; MAX_LAYERS],
             activation_was_down: [false; MAX_LAYERS],
             programs: [ProgramState::new(); MAX_PROGRAMS],
@@ -387,6 +391,48 @@ impl MacroEngine {
 
     pub const fn game_sensitivity_milli(&self) -> u16 {
         self.game_sensitivity_milli
+    }
+
+    /// Change one remotely-owned HID key without disturbing physical input.
+    pub fn set_remote_key(&mut self, usage: u8, pressed: bool) -> bool {
+        match usage {
+            0x04..=0x73 => {
+                if pressed {
+                    self.remote_keyboard.press(u16::from(usage));
+                } else {
+                    self.remote_keyboard.release(u16::from(usage));
+                }
+            }
+            0xe0..=0xe7 => {
+                let mask = 1 << (usage - 0xe0);
+                if pressed {
+                    self.remote_keyboard.modifiers |= mask;
+                } else {
+                    self.remote_keyboard.modifiers &= !mask;
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Replace the remotely-owned mouse buttons. Physical buttons are merged.
+    pub fn set_remote_mouse_buttons(&mut self, buttons: u8) {
+        self.remote_mouse_buttons = buttons;
+    }
+
+    /// Queue relative remote-control input at native HID count scale.
+    pub fn push_remote_mouse_motion(&mut self, x: i16, y: i16, wheel: i8, pan: i8) {
+        self.pending_x = self.pending_x.saturating_add(x);
+        self.pending_y = self.pending_y.saturating_add(y);
+        self.pending_wheel = self.pending_wheel.saturating_add(i16::from(wheel));
+        self.pending_pan = self.pending_pan.saturating_add(i16::from(pan));
+    }
+
+    /// Release all remotely-owned inputs. Physical input remains untouched.
+    pub fn emergency_release_remote(&mut self) {
+        self.remote_keyboard = KeyboardState::empty();
+        self.remote_mouse_buttons = 0;
     }
 
     /// Observe a physical report, update triggers, apply masks, and merge
@@ -545,11 +591,17 @@ impl MacroEngine {
         !chord.is_empty()
             && chord.iter().copied().all(|input| match input {
                 Input::Key(usage @ 0xe0..=0xe7) => {
-                    self.keyboard.modifiers & (1 << (usage - 0xe0)) != 0
+                    (self.keyboard.modifiers | self.remote_keyboard.modifiers)
+                        & (1 << (usage - 0xe0))
+                        != 0
                 }
-                Input::Key(usage) => self.keyboard.is_pressed(u16::from(usage)),
+                Input::Key(usage) => {
+                    self.keyboard.is_pressed(u16::from(usage))
+                        || self.remote_keyboard.is_pressed(u16::from(usage))
+                }
                 Input::MouseButton(button @ 1..=8) => {
-                    self.physical_mouse_buttons & (1 << (button - 1)) != 0
+                    (self.physical_mouse_buttons | self.remote_mouse_buttons) & (1 << (button - 1))
+                        != 0
                 }
                 _ => false,
             })
@@ -590,6 +642,15 @@ impl MacroEngine {
         for (keys, masked) in keyboard.keys.iter_mut().zip(mask.keys) {
             *keys &= !masked;
         }
+        keyboard.modifiers |= self.remote_keyboard.modifiers & !mask.modifiers;
+        for ((keys, remote), masked) in keyboard
+            .keys
+            .iter_mut()
+            .zip(self.remote_keyboard.keys)
+            .zip(mask.keys)
+        {
+            *keys |= remote & !masked;
+        }
         for state in &self.programs {
             keyboard.modifiers |= state.owned_keyboard.modifiers;
             for (keys, owned) in keyboard.keys.iter_mut().zip(state.owned_keyboard.keys) {
@@ -600,7 +661,8 @@ impl MacroEngine {
     }
 
     fn effective_buttons(&self, mask: InputMask) -> u8 {
-        (self.physical_mouse_buttons & !mask.mouse_buttons) | self.synthetic_buttons()
+        ((self.physical_mouse_buttons | self.remote_mouse_buttons) & !mask.mouse_buttons)
+            | self.synthetic_buttons()
     }
 }
 
@@ -896,6 +958,29 @@ mod tests {
         assert!(!engine.set_game_sensitivity_milli(99));
         assert!(!engine.set_game_sensitivity_milli(10_001));
         assert_eq!(engine.game_sensitivity_milli(), 1_500);
+    }
+
+    #[test]
+    fn remote_input_merges_triggers_motion_and_releases() {
+        let mut engine = MacroEngine::new(&CONFIG, 1);
+        assert!(engine.set_remote_key(0x1a, true));
+        assert!(engine.set_remote_key(0xe1, true));
+        assert!(!engine.set_remote_key(0x00, true));
+        let keyboard = engine.take_keyboard_output().unwrap();
+        assert!(keyboard.is_pressed(0x1a));
+        assert_eq!(keyboard.modifiers, 1 << 1);
+
+        engine.set_remote_mouse_buttons(1 << 4);
+        engine.push_remote_mouse_motion(12, -7, 1, -1);
+        engine.tick(0);
+        let mouse = engine.take_mouse_output().unwrap();
+        assert_eq!(mouse.buttons, 1);
+        assert_eq!((mouse.x, mouse.y, mouse.wheel, mouse.pan), (12, -7, 1, -1));
+
+        engine.emergency_release_remote();
+        engine.tick(1_000);
+        assert_eq!(engine.take_keyboard_output(), Some(KeyboardState::empty()));
+        assert_eq!(engine.take_mouse_output().unwrap().buttons, 0);
     }
 
     #[test]

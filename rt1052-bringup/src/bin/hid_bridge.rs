@@ -176,7 +176,8 @@ fn service_control_endpoint(
     dhcp_handle: SocketHandle,
     udp_handle: SocketHandle,
     now_us: u32,
-) -> Option<u16> {
+    last_sequence: &mut Option<u32>,
+) -> Option<ControlCommand> {
     let now = Instant::from_millis(i64::from(now_us / 1_000));
     let _ = interface.poll(now, enet, sockets);
 
@@ -218,8 +219,13 @@ fn service_control_endpoint(
         rprintln!("RTCP rejected malformed datagram len={}", length);
         return None;
     };
-    let (status, sensitivity) = match frame.command {
-        ControlCommand::SetSensitivityMilli(value) => (ACK_OK, Some(value)),
+    let duplicate = *last_sequence == Some(frame.sequence);
+    let (status, command) = match frame.command {
+        command @ (ControlCommand::SetSensitivityMilli(_)
+        | ControlCommand::SetKey { .. }
+        | ControlCommand::SetMouseButtons(_)
+        | ControlCommand::MoveMouse { .. }
+        | ControlCommand::EmergencyRelease) => (ACK_OK, Some(command)),
         _ => (ACK_UNSUPPORTED, None),
     };
     let mut ack = [0u8; 16];
@@ -228,21 +234,23 @@ fn service_control_endpoint(
     {
         let _ = socket.send_slice(&ack[..ack_len], remote.endpoint);
     }
-    if let Some(value) = sensitivity {
-        rprintln!(
-            "RTCP seq={} sensitivity={}.{:03}",
-            frame.sequence,
-            value / 1_000,
-            value % 1_000
-        );
+    if status == ACK_OK {
+        *last_sequence = Some(frame.sequence);
+    }
+    if duplicate {
+        rprintln!("RTCP seq={} duplicate ACK", frame.sequence);
+        None
+    } else if let Some(command) = command {
+        rprintln!("RTCP seq={} command={:?}", frame.sequence, command);
+        Some(command)
     } else {
         rprintln!(
             "RTCP seq={} unsupported command={:?}",
             frame.sequence,
             frame.command
         );
+        None
     }
-    sensitivity
 }
 
 fn merge_mouse(physical: MouseState, generated: MacroMouseReport) -> MouseState {
@@ -401,6 +409,7 @@ fn main() -> ! {
     let udp_handle = sockets.add(udp_socket);
     let dhcp_handle = sockets.add(dhcpv4::Socket::new());
     let mut requested_sensitivity_milli = DEFAULT_GAME_SENSITIVITY_MILLI;
+    let mut last_control_sequence = None;
     rprintln!(
         "DHCP discovering; RTCP sensitivity control UDP {}",
         CONTROL_UDP_PORT
@@ -414,13 +423,14 @@ fn main() -> ! {
     let mut source_roles_ready = false;
     let mut profile_stable_since = clock.now_us();
     'profile: loop {
-        if let Some(value) = service_control_endpoint(
+        if let Some(ControlCommand::SetSensitivityMilli(value)) = service_control_endpoint(
             &mut network,
             &mut enet,
             &mut sockets,
             dhcp_handle,
             udp_handle,
             clock.now_us(),
+            &mut last_control_sequence,
         ) {
             requested_sensitivity_milli = value;
         }
@@ -682,16 +692,32 @@ fn main() -> ! {
     let mut reconnect_descriptor = [0u8; 512];
 
     loop {
-        if let Some(value) = service_control_endpoint(
+        if let Some(command) = service_control_endpoint(
             &mut network,
             &mut enet,
             &mut sockets,
             dhcp_handle,
             udp_handle,
             clock.now_us(),
+            &mut last_control_sequence,
         ) {
-            requested_sensitivity_milli = value;
-            let _ = macro_engine.set_game_sensitivity_milli(value);
+            match command {
+                ControlCommand::SetSensitivityMilli(value) => {
+                    requested_sensitivity_milli = value;
+                    let _ = macro_engine.set_game_sensitivity_milli(value);
+                }
+                ControlCommand::SetKey { usage, pressed } => {
+                    let _ = macro_engine.set_remote_key(usage, pressed);
+                }
+                ControlCommand::SetMouseButtons(buttons) => {
+                    macro_engine.set_remote_mouse_buttons(buttons);
+                }
+                ControlCommand::MoveMouse { x, y, wheel, pan } => {
+                    macro_engine.push_remote_mouse_motion(x, y, wheel, pan);
+                }
+                ControlCommand::EmergencyRelease => macro_engine.emergency_release_remote(),
+                _ => {}
+            }
         }
         // SAFETY: Called only from this main loop; USB2 IRQ handles controller events.
         unsafe { nxp_host_task() };

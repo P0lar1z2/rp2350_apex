@@ -8,6 +8,9 @@ pub const VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 12;
 pub const MAX_PAYLOAD_LEN: usize = 16;
 pub const SET_SENSITIVITY_KIND: u8 = 6;
+pub const SET_KEY_KIND: u8 = 7;
+pub const SET_MOUSE_BUTTONS_KIND: u8 = 8;
+pub const MOVE_MOUSE_KIND: u8 = 9;
 pub const MIN_SENSITIVITY_MILLI: u16 = 100;
 pub const MAX_SENSITIVITY_MILLI: u16 = 10_000;
 
@@ -21,6 +24,20 @@ pub enum ControlCommand {
     /// In-game sensitivity in thousandths. The recoil trajectory is calibrated
     /// at 1.000 and physical mouse movement is never scaled.
     SetSensitivityMilli(u16),
+    /// Set one remote HID keyboard usage. `pressed=false` releases it.
+    SetKey {
+        usage: u8,
+        pressed: bool,
+    },
+    /// Replace the remote mouse-button bitmask (button 1 is bit zero).
+    SetMouseButtons(u8),
+    /// Queue unscaled relative mouse input. This is control input, not recoil.
+    MoveMouse {
+        x: i16,
+        y: i16,
+        wheel: i8,
+        pan: i8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,7 +147,24 @@ pub fn decode(packet: &[u8]) -> Result<CommandFrame, DecodeError> {
             }
             ControlCommand::SetSensitivityMilli(sensitivity)
         }
-        (1..=SET_SENSITIVITY_KIND, _) => return Err(DecodeError::BadPayload),
+        (SET_KEY_KIND, [usage, pressed])
+            if *pressed <= 1 && matches!(*usage, 0x04..=0x73 | 0xe0..=0xe7) =>
+        {
+            ControlCommand::SetKey {
+                usage: *usage,
+                pressed: *pressed != 0,
+            }
+        }
+        (SET_MOUSE_BUTTONS_KIND, [buttons]) => ControlCommand::SetMouseButtons(*buttons),
+        (MOVE_MOUSE_KIND, [x_low, x_high, y_low, y_high, wheel, pan]) => {
+            ControlCommand::MoveMouse {
+                x: i16::from_le_bytes([*x_low, *x_high]),
+                y: i16::from_le_bytes([*y_low, *y_high]),
+                wheel: *wheel as i8,
+                pan: *pan as i8,
+            }
+        }
+        (1..=MOVE_MOUSE_KIND, _) => return Err(DecodeError::BadPayload),
         _ => return Err(DecodeError::UnknownKind),
     };
     Ok(CommandFrame { sequence, command })
@@ -165,8 +199,8 @@ pub fn encode_ack(
 mod tests {
     use super::*;
 
-    fn command(kind: u8, sequence: u32, payload: &[u8]) -> [u8; 16] {
-        let mut packet = [0u8; 16];
+    fn command(kind: u8, sequence: u32, payload: &[u8]) -> [u8; HEADER_LEN + MAX_PAYLOAD_LEN] {
+        let mut packet = [0u8; HEADER_LEN + MAX_PAYLOAD_LEN];
         packet[..4].copy_from_slice(&MAGIC);
         packet[4] = VERSION;
         packet[5] = kind;
@@ -189,6 +223,29 @@ mod tests {
                 SET_SENSITIVITY_KIND,
                 &1_500u16.to_le_bytes()[..],
                 ControlCommand::SetSensitivityMilli(1_500),
+            ),
+            (
+                SET_KEY_KIND,
+                &[0x1a, 1][..],
+                ControlCommand::SetKey {
+                    usage: 0x1a,
+                    pressed: true,
+                },
+            ),
+            (
+                SET_MOUSE_BUTTONS_KIND,
+                &[5][..],
+                ControlCommand::SetMouseButtons(5),
+            ),
+            (
+                MOVE_MOUSE_KIND,
+                &[0x2c, 0x01, 0x85, 0xff, 0xff, 0x01][..],
+                ControlCommand::MoveMouse {
+                    x: 300,
+                    y: -123,
+                    wheel: -1,
+                    pan: 1,
+                },
             ),
         ];
         for (kind, payload, expected) in cases {
