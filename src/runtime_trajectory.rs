@@ -1,7 +1,7 @@
 //! Volatile, allocation-free recoil trajectories uploaded at runtime.
 
 pub const MAX_TRAJECTORY_SLOTS: usize = 4;
-pub const MAX_TRAJECTORY_POINTS: usize = 1_200;
+pub const MAX_TRAJECTORY_POINTS: usize = 1_536;
 pub const MIN_TICK_US: u16 = 1_000;
 pub const MAX_TICK_US: u16 = 50_000;
 const NO_SLOT: u8 = u8::MAX;
