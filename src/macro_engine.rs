@@ -429,6 +429,29 @@ impl MacroEngine {
         self.pending_pan = self.pending_pan.saturating_add(i16::from(pan));
     }
 
+    /// Queue generated recoil counts, applying the runtime sensitivity while
+    /// preserving sub-count fractions independently on each axis.
+    pub fn push_recoil_mouse_motion(&mut self, x: i16, y: i16) {
+        let x = scale_for_game_sensitivity(
+            x,
+            self.game_sensitivity_milli,
+            &mut self.sensitivity_remainder_x,
+        );
+        let y = scale_for_game_sensitivity(
+            y,
+            self.game_sensitivity_milli,
+            &mut self.sensitivity_remainder_y,
+        );
+        self.pending_x = self.pending_x.saturating_add(x);
+        self.pending_y = self.pending_y.saturating_add(y);
+    }
+
+    /// True when a physical or remotely-owned button is currently held.
+    pub fn mouse_button_down(&self, button: u8) -> bool {
+        (1..=8).contains(&button)
+            && (self.physical_mouse_buttons | self.remote_mouse_buttons) & (1 << (button - 1)) != 0
+    }
+
     /// Release all remotely-owned inputs. Physical input remains untouched.
     pub fn emergency_release_remote(&mut self) {
         self.remote_keyboard = KeyboardState::empty();
@@ -961,6 +984,19 @@ mod tests {
     }
 
     #[test]
+    fn runtime_recoil_uses_sensitivity_but_remote_motion_does_not() {
+        let mut engine = MacroEngine::new(&CONFIG, 0);
+        assert!(engine.set_game_sensitivity_milli(2_000));
+        engine.push_recoil_mouse_motion(3, -3);
+        engine.push_remote_mouse_motion(10, -10, 0, 0);
+        let report = engine.take_mouse_output().unwrap();
+        assert_eq!((report.x, report.y), (11, -11));
+        engine.push_recoil_mouse_motion(1, -1);
+        let report = engine.take_mouse_output().unwrap();
+        assert_eq!((report.x, report.y), (1, -1));
+    }
+
+    #[test]
     fn remote_input_merges_triggers_motion_and_releases() {
         let mut engine = MacroEngine::new(&CONFIG, 1);
         assert!(engine.set_remote_key(0x1a, true));
@@ -984,27 +1020,10 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_config_is_only_left_button_recoil() {
+    fn checked_in_config_defers_recoil_to_runtime_ota() {
         let config = &crate::macro_config::CONFIG;
         assert!(config.always_mask.is_empty());
-        assert_eq!(config.layers.len(), 1);
-        let layer = &config.layers[0];
-        assert!(layer.default_enabled);
-        assert_eq!(layer.activation, None);
-        assert_eq!(layer.programs.len(), 1);
-        let program = &layer.programs[0];
-        assert_eq!(program.trigger.chord, &[Input::MouseButton(1)]);
-        assert_eq!(program.trigger.behavior, TriggerBehavior::Hold);
-        assert_eq!(program.trigger.mask, Mask::None);
-        assert_eq!(program.repeat, Repeat::Once);
-        assert_eq!(program.alternate_steps, None);
-        assert!(!program.alternate_on_repeat);
-        assert!(
-            program
-                .steps
-                .iter()
-                .all(|step| matches!(step, Step::WaitMs(_) | Step::MouseMove { .. }))
-        );
+        assert!(config.layers.is_empty());
 
         let mut engine = MacroEngine::new(config, 1);
         assert_eq!(engine.observe(mouse(1)), mouse(1));

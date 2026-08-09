@@ -7,6 +7,7 @@
 
 pub mod hid_device;
 pub mod macro_engine;
+pub mod runtime_trajectory;
 pub mod macro_config {
     include!(concat!(env!("OUT_DIR"), "/macro_config.rs"));
 }

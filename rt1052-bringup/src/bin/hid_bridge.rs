@@ -18,13 +18,14 @@ use rt1052_bringup::{
     runtime_hid::{
         MAX_HID_INTERFACES, RuntimeCompositeHid, RuntimeHidInterface, high_speed_interval,
     },
+    runtime_trajectory::{RuntimeTrajectoryEngine, TrajectoryError},
 };
 use rtt_target::{ChannelMode::NoBlockSkip, rprintln, rtt_init_print};
 use smoltcp::{
     iface::{Config as NetworkConfig, Interface, SocketHandle, SocketSet, SocketStorage},
     socket::{dhcpv4, udp},
     time::Instant,
-    wire::{EthernetAddress, IpCidr},
+    wire::{EthernetAddress, IpCidr, IpEndpoint},
 };
 use usb_device::{
     UsbError,
@@ -45,6 +46,16 @@ const SOURCE_PROFILE_SETTLE_US: u32 = 1_000_000;
 const CONTROL_UDP_PORT: u16 = 1052;
 const ACK_OK: u8 = 0;
 const ACK_UNSUPPORTED: u8 = 1;
+const ACK_BAD_ARGUMENT: u8 = 2;
+const ACK_BAD_STATE: u8 = 3;
+const ACK_CRC_MISMATCH: u8 = 4;
+
+#[derive(Clone, Copy)]
+struct LastControlAck {
+    sequence: u32,
+    kind: u8,
+    status: u8,
+}
 
 #[unsafe(link_section = ".usb_device.endpoint_memory")]
 static EP_MEMORY: EndpointMemory<2048> = EndpointMemory::new();
@@ -176,7 +187,9 @@ fn service_control_endpoint(
     dhcp_handle: SocketHandle,
     udp_handle: SocketHandle,
     now_us: u32,
-    last_sequence: &mut Option<u32>,
+    last_ack: &mut Option<LastControlAck>,
+    trajectories: &mut RuntimeTrajectoryEngine,
+    input_subscriber: &mut Option<IpEndpoint>,
 ) -> Option<ControlCommand> {
     let now = Instant::from_millis(i64::from(now_us / 1_000));
     let _ = interface.poll(now, enet, sockets);
@@ -219,25 +232,85 @@ fn service_control_endpoint(
         rprintln!("RTCP rejected malformed datagram len={}", length);
         return None;
     };
-    let duplicate = *last_sequence == Some(frame.sequence);
-    let (status, command) = match frame.command {
-        command @ (ControlCommand::SetSensitivityMilli(_)
+    let kind = datagram[5];
+    let duplicate_status = last_ack
+        .filter(|last| last.sequence == frame.sequence && last.kind == kind)
+        .map(|last| last.status);
+    let mut command = None;
+    let send_status = matches!(frame.command, ControlCommand::QueryStatus);
+    let status = duplicate_status.unwrap_or_else(|| match frame.command {
+        command_value @ (ControlCommand::SetSensitivityMilli(_)
         | ControlCommand::SetKey { .. }
         | ControlCommand::SetMouseButtons(_)
         | ControlCommand::MoveMouse { .. }
-        | ControlCommand::EmergencyRelease) => (ACK_OK, Some(command)),
-        _ => (ACK_UNSUPPORTED, None),
-    };
-    let mut ack = [0u8; 16];
-    if let Ok(ack_len) = control_protocol::encode_ack(&mut ack, frame.sequence, datagram[5], status)
+        | ControlCommand::EmergencyRelease) => {
+            command = Some(command_value);
+            ACK_OK
+        }
+        ControlCommand::BeginTrajectory {
+            slot,
+            length,
+            tick_us,
+            crc32,
+        } => trajectory_status(trajectories.begin_upload(slot, length, tick_us, crc32)),
+        ControlCommand::TrajectoryChunk {
+            slot,
+            offset,
+            count,
+            packed,
+        } => trajectory_status(trajectories.write_chunk(
+            slot,
+            offset,
+            count,
+            &packed[..usize::from(count) * 4],
+        )),
+        ControlCommand::CommitTrajectory(slot) => {
+            trajectory_status(trajectories.commit_upload(slot))
+        }
+        ControlCommand::SelectTrajectory(slot) => trajectory_status(trajectories.select_slot(slot)),
+        ControlCommand::SubscribeInput(enabled) => {
+            if enabled {
+                *input_subscriber = Some(remote.endpoint);
+            } else if *input_subscriber == Some(remote.endpoint) {
+                *input_subscriber = None;
+            }
+            ACK_OK
+        }
+        ControlCommand::QueryStatus => ACK_OK,
+        _ => ACK_UNSUPPORTED,
+    });
+    if duplicate_status.is_none() {
+        *last_ack = Some(LastControlAck {
+            sequence: frame.sequence,
+            kind,
+            status,
+        });
+    }
+    let mut ack = [0u8; control_protocol::HEADER_LEN + 2];
+    if let Ok(ack_len) = control_protocol::encode_ack(&mut ack, frame.sequence, kind, status)
         && socket.can_send()
     {
         let _ = socket.send_slice(&ack[..ack_len], remote.endpoint);
     }
-    if status == ACK_OK {
-        *last_sequence = Some(frame.sequence);
+    if send_status && status == ACK_OK {
+        let slots = core::array::from_fn(|slot| {
+            let status = trajectories.slot_status(slot as u8).unwrap_or_default();
+            (status.length, status.tick_us, status.crc32)
+        });
+        let mut event = [0u8; control_protocol::HEADER_LEN + control_protocol::MAX_PAYLOAD_LEN];
+        if let Ok(event_len) = control_protocol::encode_status_event(
+            &mut event,
+            frame.sequence,
+            trajectories.active_slot(),
+            trajectories.valid_mask(),
+            trajectories.is_running(),
+            &slots,
+        ) && socket.can_send()
+        {
+            let _ = socket.send_slice(&event[..event_len], remote.endpoint);
+        }
     }
-    if duplicate {
+    if duplicate_status.is_some() {
         rprintln!("RTCP seq={} duplicate ACK", frame.sequence);
         None
     } else if let Some(command) = command {
@@ -245,12 +318,58 @@ fn service_control_endpoint(
         Some(command)
     } else {
         rprintln!(
-            "RTCP seq={} unsupported command={:?}",
+            "RTCP seq={} kind={} status={}",
             frame.sequence,
-            frame.command
+            kind,
+            status
         );
         None
     }
+}
+
+fn trajectory_status(result: Result<(), TrajectoryError>) -> u8 {
+    match result {
+        Ok(()) => ACK_OK,
+        Err(
+            TrajectoryError::BadSlot
+            | TrajectoryError::BadLength
+            | TrajectoryError::BadTick
+            | TrajectoryError::BadChunk,
+        ) => ACK_BAD_ARGUMENT,
+        Err(TrajectoryError::CrcMismatch) => ACK_CRC_MISMATCH,
+        Err(
+            TrajectoryError::NoUpload
+            | TrajectoryError::WrongSlot
+            | TrajectoryError::OutOfOrder
+            | TrajectoryError::Incomplete
+            | TrajectoryError::EmptySlot,
+        ) => ACK_BAD_STATE,
+    }
+}
+
+fn send_input_event(
+    sockets: &mut SocketSet<'_>,
+    udp_handle: SocketHandle,
+    endpoint: IpEndpoint,
+    sequence: u32,
+    keyboard: KeyboardState,
+    mouse_buttons: u8,
+) -> bool {
+    let socket = sockets.get_mut::<udp::Socket>(udp_handle);
+    if !socket.can_send() {
+        return false;
+    }
+    let mut event = [0u8; control_protocol::HEADER_LEN + control_protocol::MAX_PAYLOAD_LEN];
+    let Ok(length) = control_protocol::encode_input_event(
+        &mut event,
+        sequence,
+        keyboard.modifiers,
+        &keyboard.keys,
+        mouse_buttons,
+    ) else {
+        return false;
+    };
+    socket.send_slice(&event[..length], endpoint).is_ok()
 }
 
 fn merge_mouse(physical: MouseState, generated: MacroMouseReport) -> MouseState {
@@ -409,7 +528,9 @@ fn main() -> ! {
     let udp_handle = sockets.add(udp_socket);
     let dhcp_handle = sockets.add(dhcpv4::Socket::new());
     let mut requested_sensitivity_milli = DEFAULT_GAME_SENSITIVITY_MILLI;
-    let mut last_control_sequence = None;
+    let mut last_control_ack = None;
+    let mut trajectories = RuntimeTrajectoryEngine::new();
+    let mut input_subscriber = None;
     rprintln!(
         "DHCP discovering; RTCP sensitivity control UDP {}",
         CONTROL_UDP_PORT
@@ -430,7 +551,9 @@ fn main() -> ! {
             dhcp_handle,
             udp_handle,
             clock.now_us(),
-            &mut last_control_sequence,
+            &mut last_control_ack,
+            &mut trajectories,
+            &mut input_subscriber,
         ) {
             requested_sensitivity_milli = value;
         }
@@ -690,6 +813,10 @@ fn main() -> ! {
     let mut host_to_profile: [Option<usize>; MAX_HID_INTERFACES] =
         core::array::from_fn(|index| profiles[index].map(|_| index));
     let mut reconnect_descriptor = [0u8; 512];
+    let mut physical_keyboard = KeyboardState::empty();
+    let mut physical_mouse_buttons = 0u8;
+    let mut input_event_dirty = true;
+    let mut input_event_sequence = 1u32;
 
     loop {
         if let Some(command) = service_control_endpoint(
@@ -699,7 +826,9 @@ fn main() -> ! {
             dhcp_handle,
             udp_handle,
             clock.now_us(),
-            &mut last_control_sequence,
+            &mut last_control_ack,
+            &mut trajectories,
+            &mut input_subscriber,
         ) {
             match command {
                 ControlCommand::SetSensitivityMilli(value) => {
@@ -715,9 +844,26 @@ fn main() -> ! {
                 ControlCommand::MoveMouse { x, y, wheel, pan } => {
                     macro_engine.push_remote_mouse_motion(x, y, wheel, pan);
                 }
-                ControlCommand::EmergencyRelease => macro_engine.emergency_release_remote(),
+                ControlCommand::EmergencyRelease => {
+                    macro_engine.emergency_release_remote();
+                    trajectories.cancel_playback();
+                }
                 _ => {}
             }
+        }
+        if input_event_dirty
+            && let Some(endpoint) = input_subscriber
+            && send_input_event(
+                &mut sockets,
+                udp_handle,
+                endpoint,
+                input_event_sequence,
+                physical_keyboard,
+                physical_mouse_buttons,
+            )
+        {
+            input_event_dirty = false;
+            input_event_sequence = input_event_sequence.wrapping_add(1);
         }
         // SAFETY: Called only from this main loop; USB2 IRQ handles controller events.
         unsafe { nxp_host_task() };
@@ -749,7 +895,11 @@ fn main() -> ! {
             }
         }
 
-        macro_engine.tick(clock.now_us());
+        let tick_now_us = clock.now_us();
+        macro_engine.tick(tick_now_us);
+        if let Some(point) = trajectories.tick(tick_now_us, macro_engine.mouse_button_down(1)) {
+            macro_engine.push_recoil_mouse_motion(point.x, point.y);
+        }
         if device_configured {
             if let Some(index) = keyboard_interface
                 && !pending_ready[index]
@@ -832,6 +982,10 @@ fn main() -> ! {
                         macro_engine = MacroEngine::new(&MACRO_CONFIG, macro_seed);
                         let _ =
                             macro_engine.set_game_sensitivity_milli(requested_sensitivity_milli);
+                        trajectories.cancel_playback();
+                        physical_keyboard = KeyboardState::empty();
+                        physical_mouse_buttons = 0;
+                        input_event_dirty = true;
                         rprintln!(
                             "OTG2 HID[{}] profile {:?} detached; OTG1 disconnected from PC",
                             event.interface_index,
@@ -932,6 +1086,17 @@ fn main() -> ! {
             pending[index][..length].copy_from_slice(&report.data[..length]);
             let decoded = decoders[index].decode(&pending[index][..length]);
             if let Some(original) = decoded {
+                match original {
+                    DecodedReport::Keyboard(state) if state != physical_keyboard => {
+                        physical_keyboard = state;
+                        input_event_dirty = true;
+                    }
+                    DecodedReport::Mouse(state) if state.buttons != physical_mouse_buttons => {
+                        physical_mouse_buttons = state.buttons;
+                        input_event_dirty = true;
+                    }
+                    _ => {}
+                }
                 let mut transformed = macro_engine.observe(original);
                 let mut needs_encode = transformed != original;
                 match transformed {

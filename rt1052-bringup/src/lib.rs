@@ -5,6 +5,9 @@ pub mod hid_report;
 
 pub mod control_protocol;
 
+#[path = "../../src/runtime_trajectory.rs"]
+pub mod runtime_trajectory;
+
 #[cfg(feature = "nxp-enet")]
 pub mod enet_device;
 
