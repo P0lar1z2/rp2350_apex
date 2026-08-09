@@ -167,9 +167,7 @@ def elf_flash_payload(path: Path) -> bytes:
     return bytes(payload)
 
 
-def build_image(args: argparse.Namespace, backup_path: Path) -> Path:
-    validate_backup(backup_path)
-    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+def build_firmware() -> None:
     run(
         [
             "cargo",
@@ -185,6 +183,17 @@ def build_image(args: argparse.Namespace, backup_path: Path) -> Path:
             "hid_bridge",
         ]
     )
+
+
+def build_image(
+    args: argparse.Namespace, backup_path: Path, *, compile_firmware: bool = True
+) -> Path:
+    validate_backup(backup_path)
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    if compile_firmware:
+        build_firmware()
+    elif not ELF_PATH.is_file():
+        raise SystemExit(f"prebuilt firmware ELF not found: {ELF_PATH}")
     app = elf_flash_payload(ELF_PATH)
     app_path = ARTIFACT_DIR / "hid_bridge-xip-app.bin"
     app_path.write_bytes(app)
@@ -261,8 +270,12 @@ def boot_target(args: argparse.Namespace) -> None:
 
 
 def flash(args: argparse.Namespace) -> None:
+    # Fail on compiler/linker errors before pausing the target for a 32 MiB
+    # backup. The wrapper workflow may prebuild explicitly for clearer phases.
+    if not args.skip_build:
+        build_firmware()
     backup_path = backup(args)
-    image_path = build_image(args, backup_path)
+    image_path = build_image(args, backup_path, compile_firmware=False)
     if not args.yes:
         raise SystemExit(
             f"backup and image are ready at {ARTIFACT_DIR}; rerun with `flash --yes` to program"
@@ -298,6 +311,11 @@ def parser() -> argparse.ArgumentParser:
     flash_parser = sub.add_parser("flash", help="back up, build, program, and verify")
     flash_parser.add_argument("--output", help="path for the pre-flash backup")
     flash_parser.add_argument("--yes", action="store_true", help="confirm sector erase/programming")
+    flash_parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="use an existing release ELF (intended for an orchestrating workflow)",
+    )
     verify_parser = sub.add_parser("verify", help="read back an existing image and boot it")
     verify_parser.add_argument("image", type=Path)
     return result
