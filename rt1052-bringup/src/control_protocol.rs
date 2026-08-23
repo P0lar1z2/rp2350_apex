@@ -20,11 +20,15 @@ pub const COMMIT_TRAJECTORY_KIND: u8 = 12;
 pub const SELECT_TRAJECTORY_KIND: u8 = 13;
 pub const SUBSCRIBE_INPUT_KIND: u8 = 14;
 pub const QUERY_STATUS_KIND: u8 = 15;
-pub const QUERY_STATUS_PAGE_KIND: u8 = 16;
+pub const SAVE_TRAJECTORIES_KIND: u8 = 16;
+pub const PROBE_FLASH_KIND: u8 = 17;
+pub const QUERY_FLASH_KIND: u8 = 18;
+pub const QUERY_STATUS_PAGE_KIND: u8 = 19;
 pub const ACK_KIND: u8 = 0x80;
 pub const INPUT_EVENT_KIND: u8 = 0x81;
 pub const STATUS_EVENT_KIND: u8 = 0x82;
-pub const STATUS_PAGE_EVENT_KIND: u8 = 0x83;
+pub const FLASH_EVENT_KIND: u8 = 0x83;
+pub const STATUS_PAGE_EVENT_KIND: u8 = 0x84;
 pub const LEGACY_EXTENDED_STATUS_FLAG: u8 = 0x80;
 pub const STATUS_PAGE_HEADER_LEN: usize = 6;
 pub const STATUS_PAGE_SLOTS: usize = (MAX_PAYLOAD_LEN - STATUS_PAGE_HEADER_LEN) / 8;
@@ -75,6 +79,9 @@ pub enum ControlCommand {
     SelectTrajectory(u8),
     SubscribeInput(bool),
     QueryStatus,
+    SaveTrajectories,
+    ProbeFlash(u32),
+    QueryFlash,
     QueryStatusPage(u8),
 }
 
@@ -241,6 +248,11 @@ pub fn decode(packet: &[u8]) -> Result<CommandFrame, DecodeError> {
             ControlCommand::SubscribeInput(*enabled != 0)
         }
         (QUERY_STATUS_KIND, []) => ControlCommand::QueryStatus,
+        (SAVE_TRAJECTORIES_KIND, []) => ControlCommand::SaveTrajectories,
+        (PROBE_FLASH_KIND, [a, b, c, d]) => {
+            ControlCommand::ProbeFlash(u32::from_le_bytes([*a, *b, *c, *d]))
+        }
+        (QUERY_FLASH_KIND, []) => ControlCommand::QueryFlash,
         (QUERY_STATUS_PAGE_KIND, [page]) => ControlCommand::QueryStatusPage(*page),
         (1..=QUERY_STATUS_PAGE_KIND, _) => return Err(DecodeError::BadPayload),
         _ => return Err(DecodeError::UnknownKind),
@@ -499,6 +511,17 @@ mod tests {
                 ControlCommand::SubscribeInput(true),
             ),
             (QUERY_STATUS_KIND, &[][..], ControlCommand::QueryStatus),
+            (
+                SAVE_TRAJECTORIES_KIND,
+                &[][..],
+                ControlCommand::SaveTrajectories,
+            ),
+            (
+                PROBE_FLASH_KIND,
+                &0x61fe_0000u32.to_le_bytes()[..],
+                ControlCommand::ProbeFlash(0x61fe_0000),
+            ),
+            (QUERY_FLASH_KIND, &[][..], ControlCommand::QueryFlash),
             (
                 QUERY_STATUS_PAGE_KIND,
                 &[2][..],
