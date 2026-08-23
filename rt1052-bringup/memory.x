@@ -31,4 +31,16 @@ SECTIONS
     . = ALIGN(32);
     __usb_dma_end = .;
   } > OCRAM
+
+  /* Sixteen volatile trajectory slots plus one upload staging buffer require
+   * roughly 102 KiB. Keeping this NOLOAD arena in OCRAM prevents the large
+   * engine from consuming the 128 KiB DTCM main stack. Firmware clears the
+   * arena explicitly before first use. */
+  .runtime_trajectory (NOLOAD) : ALIGN(32)
+  {
+    __runtime_trajectory_start = .;
+    KEEP(*(.runtime_trajectory .runtime_trajectory.*));
+    . = ALIGN(32);
+    __runtime_trajectory_end = .;
+  } > OCRAM
 } INSERT AFTER .uninit;

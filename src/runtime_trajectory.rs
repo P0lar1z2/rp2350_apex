@@ -1,10 +1,10 @@
 //! Volatile, allocation-free recoil trajectories uploaded at runtime.
 
-pub const MAX_TRAJECTORY_SLOTS: usize = 4;
+pub const MAX_TRAJECTORY_SLOTS: usize = 16;
 pub const MAX_TRAJECTORY_POINTS: usize = 1_536;
 pub const MIN_TICK_US: u16 = 1_000;
 pub const MAX_TICK_US: u16 = 50_000;
-const NO_SLOT: u8 = u8::MAX;
+pub const NO_TRAJECTORY_SLOT: u8 = u8::MAX;
 const MAX_CATCH_UP_POINTS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -49,7 +49,9 @@ impl UploadState {
     const fn empty() -> Self {
         Self {
             points: [TrajectoryPoint { x: 0, y: 0 }; MAX_TRAJECTORY_POINTS],
-            target_slot: NO_SLOT,
+            // Ignored while `active` is false. Keeping this zero makes the
+            // entire engine valid when zero-initialized in OCRAM.
+            target_slot: 0,
             length: 0,
             tick_us: 0,
             expected_crc32: 0,
@@ -84,7 +86,9 @@ pub struct SlotStatus {
 pub struct RuntimeTrajectoryEngine {
     slots: [TrajectorySlot; MAX_TRAJECTORY_SLOTS],
     upload: UploadState,
-    active_slot: u8,
+    // Zero means no selection; values 1..=16 encode slots 0..=15. This keeps
+    // an all-zero OCRAM allocation a valid freshly initialized engine.
+    active_slot_plus_one: u8,
     running: bool,
     trigger_was_down: bool,
     point_index: u16,
@@ -96,7 +100,7 @@ impl RuntimeTrajectoryEngine {
         Self {
             slots: [TrajectorySlot::empty(); MAX_TRAJECTORY_SLOTS],
             upload: UploadState::empty(),
-            active_slot: NO_SLOT,
+            active_slot_plus_one: 0,
             running: false,
             trigger_was_down: false,
             point_index: 0,
@@ -191,41 +195,51 @@ impl RuntimeTrajectoryEngine {
         target.crc32 = actual_crc32;
         target.valid = true;
         self.upload.active = false;
-        if self.active_slot == slot {
+        if self.active_slot() == Some(slot) {
             self.cancel_playback();
         }
         Ok(())
     }
 
     pub fn select_slot(&mut self, slot: u8) -> Result<(), TrajectoryError> {
+        if slot == NO_TRAJECTORY_SLOT {
+            self.clear_selection();
+            return Ok(());
+        }
         let Some(selected) = self.slots.get(usize::from(slot)) else {
             return Err(TrajectoryError::BadSlot);
         };
         if !selected.valid {
             return Err(TrajectoryError::EmptySlot);
         }
-        self.active_slot = slot;
+        self.active_slot_plus_one = slot + 1;
         self.cancel_playback();
         Ok(())
     }
 
     pub const fn active_slot(&self) -> Option<u8> {
-        if self.active_slot == NO_SLOT {
+        if self.active_slot_plus_one == 0 {
             None
         } else {
-            Some(self.active_slot)
+            Some(self.active_slot_plus_one - 1)
         }
+    }
+
+    /// Explicitly select no trajectory. Committed slots remain intact.
+    pub fn clear_selection(&mut self) {
+        self.active_slot_plus_one = 0;
+        self.cancel_playback();
     }
 
     pub const fn is_running(&self) -> bool {
         self.running
     }
 
-    pub fn valid_mask(&self) -> u8 {
+    pub fn valid_mask(&self) -> u16 {
         self.slots
             .iter()
             .enumerate()
-            .fold(0u8, |mask, (index, slot)| {
+            .fold(0u16, |mask, (index, slot)| {
                 if slot.valid {
                     mask | (1 << index)
                 } else {
@@ -265,7 +279,11 @@ impl RuntimeTrajectoryEngine {
             return None;
         }
 
-        let slot = &self.slots[usize::from(self.active_slot)];
+        let Some(active_slot) = self.active_slot() else {
+            self.cancel_playback();
+            return None;
+        };
+        let slot = &self.slots[usize::from(active_slot)];
         let mut output = TrajectoryPoint::default();
         let mut emitted = false;
         for _ in 0..MAX_CATCH_UP_POINTS {
@@ -394,7 +412,7 @@ mod tests {
     fn validates_slot_length_tick_and_empty_selection() {
         let mut engine = RuntimeTrajectoryEngine::new();
         assert_eq!(
-            engine.begin_upload(4, 1, 2_000, 0),
+            engine.begin_upload(MAX_TRAJECTORY_SLOTS as u8, 1, 2_000, 0),
             Err(TrajectoryError::BadSlot)
         );
         assert_eq!(
@@ -406,5 +424,42 @@ mod tests {
             Err(TrajectoryError::BadTick)
         );
         assert_eq!(engine.select_slot(0), Err(TrajectoryError::EmptySlot));
+    }
+
+    #[test]
+    fn supports_sixteen_slots_and_explicit_no_selection() {
+        let point = [TrajectoryPoint { x: 3, y: -4 }];
+        let mut bytes = [0u8; 4];
+        packed(&point, &mut bytes);
+        let mut engine = RuntimeTrajectoryEngine::new();
+        let last = (MAX_TRAJECTORY_SLOTS - 1) as u8;
+
+        engine
+            .begin_upload(last, 1, 2_500, crc32_points(&point))
+            .unwrap();
+        engine.write_chunk(last, 0, 1, &bytes).unwrap();
+        engine.commit_upload(last).unwrap();
+        engine.select_slot(last).unwrap();
+
+        assert_eq!(engine.active_slot(), Some(last));
+        assert_eq!(engine.valid_mask(), 1 << last);
+        assert_eq!(engine.tick(1_000, true), Some(point[0]));
+
+        engine.select_slot(NO_TRAJECTORY_SLOT).unwrap();
+        assert_eq!(engine.active_slot(), None);
+        assert!(!engine.is_running());
+        assert_eq!(engine.tick(2_000, false), None);
+        assert_eq!(engine.tick(3_000, true), None);
+        assert!(engine.slot_status(last).unwrap().valid);
+    }
+
+    #[test]
+    fn fresh_engine_is_valid_when_zero_initialized() {
+        // The RT1052 firmware places this large value in an OCRAM NOLOAD
+        // section and explicitly clears it before use.
+        let engine: RuntimeTrajectoryEngine = unsafe { core::mem::zeroed() };
+        assert_eq!(engine.active_slot(), None);
+        assert_eq!(engine.valid_mask(), 0);
+        assert!(!engine.is_running());
     }
 }

@@ -1,7 +1,10 @@
 #![no_std]
 #![no_main]
 
-use core::ptr::{read_volatile, write_volatile};
+use core::{
+    cell::UnsafeCell,
+    ptr::{read_volatile, write_volatile},
+};
 
 use cortex_m_rt::entry;
 use imxrt_ral as ral;
@@ -18,7 +21,7 @@ use rt1052_bringup::{
     runtime_hid::{
         MAX_HID_INTERFACES, RuntimeCompositeHid, RuntimeHidInterface, high_speed_interval,
     },
-    runtime_trajectory::{RuntimeTrajectoryEngine, TrajectoryError},
+    runtime_trajectory::{MAX_TRAJECTORY_SLOTS, RuntimeTrajectoryEngine, TrajectoryError},
 };
 use rtt_target::{ChannelMode::NoBlockSkip, rprintln, rtt_init_print};
 use smoltcp::{
@@ -62,6 +65,20 @@ static EP_MEMORY: EndpointMemory<2048> = EndpointMemory::new();
 
 #[unsafe(link_section = ".usb_device.endpoint_state")]
 static EP_STATE: EndpointState = EndpointState::max_endpoints();
+
+#[repr(transparent)]
+struct TrajectoryStorage(UnsafeCell<RuntimeTrajectoryEngine>);
+
+// SAFETY: The storage is initialized once before interrupts are enabled and is
+// thereafter accessed only from the single firmware main loop.
+unsafe impl Sync for TrajectoryStorage {}
+
+/// Sixteen full trajectory slots plus the transactional staging buffer no
+/// longer fit safely in the 128 KiB DTCM main stack. Keep them in a dedicated
+/// zeroed OCRAM section, separate from USB/ENET DMA allocations.
+#[unsafe(link_section = ".runtime_trajectory.storage")]
+static TRAJECTORY_STORAGE: TrajectoryStorage =
+    TrajectoryStorage(UnsafeCell::new(RuntimeTrajectoryEngine::new()));
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -237,7 +254,11 @@ fn service_control_endpoint(
         .filter(|last| last.sequence == frame.sequence && last.kind == kind)
         .map(|last| last.status);
     let mut command = None;
-    let send_status = matches!(frame.command, ControlCommand::QueryStatus);
+    let send_legacy_status = matches!(frame.command, ControlCommand::QueryStatus);
+    let status_page = match frame.command {
+        ControlCommand::QueryStatusPage(page) => Some(page),
+        _ => None,
+    };
     let status = duplicate_status.unwrap_or_else(|| match frame.command {
         command_value @ (ControlCommand::SetSensitivityMilli(_)
         | ControlCommand::SetKey { .. }
@@ -277,6 +298,12 @@ fn service_control_endpoint(
             ACK_OK
         }
         ControlCommand::QueryStatus => ACK_OK,
+        ControlCommand::QueryStatusPage(page)
+            if usize::from(page) < control_protocol::STATUS_PAGE_COUNT =>
+        {
+            ACK_OK
+        }
+        ControlCommand::QueryStatusPage(_) => ACK_BAD_ARGUMENT,
         _ => ACK_UNSUPPORTED,
     });
     if duplicate_status.is_none() {
@@ -292,15 +319,39 @@ fn service_control_endpoint(
     {
         let _ = socket.send_slice(&ack[..ack_len], remote.endpoint);
     }
-    if send_status && status == ACK_OK {
-        let slots = core::array::from_fn(|slot| {
+    if send_legacy_status && status == ACK_OK {
+        let slots: [(u16, u16, u32); 4] = core::array::from_fn(|slot| {
             let status = trajectories.slot_status(slot as u8).unwrap_or_default();
             (status.length, status.tick_us, status.crc32)
         });
+        let active_slot = trajectories.active_slot().filter(|slot| *slot < 4);
+        let legacy_valid_mask = (trajectories.valid_mask() as u8 & 0x0f)
+            | control_protocol::LEGACY_EXTENDED_STATUS_FLAG;
         let mut event = [0u8; control_protocol::HEADER_LEN + control_protocol::MAX_PAYLOAD_LEN];
         if let Ok(event_len) = control_protocol::encode_status_event(
             &mut event,
             frame.sequence,
+            active_slot,
+            legacy_valid_mask,
+            trajectories.is_running(),
+            &slots,
+        ) && socket.can_send()
+        {
+            let _ = socket.send_slice(&event[..event_len], remote.endpoint);
+        }
+    }
+    if let Some(page) = status_page
+        && status == ACK_OK
+    {
+        let slots: [(u16, u16, u32); MAX_TRAJECTORY_SLOTS] = core::array::from_fn(|slot| {
+            let status = trajectories.slot_status(slot as u8).unwrap_or_default();
+            (status.length, status.tick_us, status.crc32)
+        });
+        let mut event = [0u8; control_protocol::HEADER_LEN + control_protocol::MAX_PAYLOAD_LEN];
+        if let Ok(event_len) = control_protocol::encode_status_page_event(
+            &mut event,
+            frame.sequence,
+            page,
             trajectories.active_slot(),
             trajectories.valid_mask(),
             trajectories.is_running(),
@@ -461,6 +512,16 @@ fn main() -> ! {
     rt1052_bringup::use_nxp_default_flexram();
     cortex_m::interrupt::disable();
     rt1052_bringup::prepare_runtime_memory();
+    let trajectories = {
+        let storage = TRAJECTORY_STORAGE.0.get();
+        // SAFETY: The linker reserves the complete OCRAM section exclusively
+        // for this static. All-zero is a valid fresh engine representation,
+        // and initialization occurs once while interrupts are disabled.
+        unsafe {
+            storage.write_bytes(0, 1);
+            &mut *storage
+        }
+    };
     write32(SCB_VTOR, 0);
     rtt_init_print!(NoBlockSkip, 4096);
 
@@ -529,7 +590,6 @@ fn main() -> ! {
     let dhcp_handle = sockets.add(dhcpv4::Socket::new());
     let mut requested_sensitivity_milli = DEFAULT_GAME_SENSITIVITY_MILLI;
     let mut last_control_ack = None;
-    let mut trajectories = RuntimeTrajectoryEngine::new();
     let mut input_subscriber = None;
     rprintln!(
         "DHCP discovering; RTCP sensitivity control UDP {}",
@@ -552,7 +612,7 @@ fn main() -> ! {
             udp_handle,
             clock.now_us(),
             &mut last_control_ack,
-            &mut trajectories,
+            trajectories,
             &mut input_subscriber,
         ) {
             requested_sensitivity_milli = value;
@@ -827,7 +887,7 @@ fn main() -> ! {
             udp_handle,
             clock.now_us(),
             &mut last_control_ack,
-            &mut trajectories,
+            trajectories,
             &mut input_subscriber,
         ) {
             match command {

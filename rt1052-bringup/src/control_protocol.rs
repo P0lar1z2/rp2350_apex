@@ -3,6 +3,8 @@
 //! Receiving a packet only validates and converts it into a `ControlCommand`.
 //! Callers must enqueue the command and execute it outside ENET / USB IRQ context.
 
+use crate::runtime_trajectory::MAX_TRAJECTORY_SLOTS;
+
 pub const MAGIC: [u8; 4] = *b"RTCP";
 pub const VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 12;
@@ -18,9 +20,15 @@ pub const COMMIT_TRAJECTORY_KIND: u8 = 12;
 pub const SELECT_TRAJECTORY_KIND: u8 = 13;
 pub const SUBSCRIBE_INPUT_KIND: u8 = 14;
 pub const QUERY_STATUS_KIND: u8 = 15;
+pub const QUERY_STATUS_PAGE_KIND: u8 = 16;
 pub const ACK_KIND: u8 = 0x80;
 pub const INPUT_EVENT_KIND: u8 = 0x81;
 pub const STATUS_EVENT_KIND: u8 = 0x82;
+pub const STATUS_PAGE_EVENT_KIND: u8 = 0x83;
+pub const LEGACY_EXTENDED_STATUS_FLAG: u8 = 0x80;
+pub const STATUS_PAGE_HEADER_LEN: usize = 6;
+pub const STATUS_PAGE_SLOTS: usize = (MAX_PAYLOAD_LEN - STATUS_PAGE_HEADER_LEN) / 8;
+pub const STATUS_PAGE_COUNT: usize = MAX_TRAJECTORY_SLOTS.div_ceil(STATUS_PAGE_SLOTS);
 pub const MIN_SENSITIVITY_MILLI: u16 = 100;
 pub const MAX_SENSITIVITY_MILLI: u16 = 10_000;
 
@@ -67,6 +75,7 @@ pub enum ControlCommand {
     SelectTrajectory(u8),
     SubscribeInput(bool),
     QueryStatus,
+    QueryStatusPage(u8),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,7 +241,8 @@ pub fn decode(packet: &[u8]) -> Result<CommandFrame, DecodeError> {
             ControlCommand::SubscribeInput(*enabled != 0)
         }
         (QUERY_STATUS_KIND, []) => ControlCommand::QueryStatus,
-        (1..=QUERY_STATUS_KIND, _) => return Err(DecodeError::BadPayload),
+        (QUERY_STATUS_PAGE_KIND, [page]) => ControlCommand::QueryStatusPage(*page),
+        (1..=QUERY_STATUS_PAGE_KIND, _) => return Err(DecodeError::BadPayload),
         _ => return Err(DecodeError::UnknownKind),
     };
     Ok(CommandFrame { sequence, command })
@@ -284,7 +294,7 @@ pub fn encode_input_event(
     Ok(length)
 }
 
-/// Encode all volatile trajectory slots. Per slot: length, tick period, CRC32.
+/// Encode the four-slot compatibility status. Per slot: length, tick and CRC.
 pub fn encode_status_event(
     output: &mut [u8],
     sequence: u32,
@@ -304,6 +314,44 @@ pub fn encode_status_event(
     output[14] = u8::from(running);
     let mut cursor = 15;
     for (slot_length, tick_us, crc32) in slots {
+        output[cursor..cursor + 2].copy_from_slice(&slot_length.to_le_bytes());
+        output[cursor + 2..cursor + 4].copy_from_slice(&tick_us.to_le_bytes());
+        output[cursor + 4..cursor + 8].copy_from_slice(&crc32.to_le_bytes());
+        cursor += 8;
+    }
+    Ok(length)
+}
+
+/// Encode one page of the extended 16-slot trajectory status. The six-byte
+/// page header is followed by up to seven legacy eight-byte slot records, so
+/// the event remains within RTCP v1's 64-byte payload limit.
+pub fn encode_status_page_event(
+    output: &mut [u8],
+    sequence: u32,
+    page: u8,
+    active_slot: Option<u8>,
+    valid_mask: u16,
+    running: bool,
+    slots: &[(u16, u16, u32); MAX_TRAJECTORY_SLOTS],
+) -> Result<usize, ()> {
+    let start = usize::from(page).saturating_mul(STATUS_PAGE_SLOTS);
+    if start >= slots.len() {
+        return Err(());
+    }
+    let count = core::cmp::min(STATUS_PAGE_SLOTS, slots.len() - start);
+    let payload_len = STATUS_PAGE_HEADER_LEN + count * 8;
+    let length = HEADER_LEN + payload_len;
+    if output.len() < length {
+        return Err(());
+    }
+    encode_header(output, STATUS_PAGE_EVENT_KIND, payload_len as u8, sequence);
+    output[12] = active_slot.unwrap_or(u8::MAX);
+    output[13] = u8::from(running);
+    output[14] = MAX_TRAJECTORY_SLOTS as u8;
+    output[15] = start as u8;
+    output[16..18].copy_from_slice(&valid_mask.to_le_bytes());
+    let mut cursor = 18;
+    for (slot_length, tick_us, crc32) in &slots[start..start + count] {
         output[cursor..cursor + 2].copy_from_slice(&slot_length.to_le_bytes());
         output[cursor + 2..cursor + 4].copy_from_slice(&tick_us.to_le_bytes());
         output[cursor + 4..cursor + 8].copy_from_slice(&crc32.to_le_bytes());
@@ -442,8 +490,8 @@ mod tests {
             ),
             (
                 SELECT_TRAJECTORY_KIND,
-                &[3][..],
-                ControlCommand::SelectTrajectory(3),
+                &[u8::MAX][..],
+                ControlCommand::SelectTrajectory(u8::MAX),
             ),
             (
                 SUBSCRIBE_INPUT_KIND,
@@ -451,6 +499,11 @@ mod tests {
                 ControlCommand::SubscribeInput(true),
             ),
             (QUERY_STATUS_KIND, &[][..], ControlCommand::QueryStatus),
+            (
+                QUERY_STATUS_PAGE_KIND,
+                &[2][..],
+                ControlCommand::QueryStatusPage(2),
+            ),
         ] {
             let packet = command(kind, 9, payload);
             assert_eq!(
@@ -495,6 +548,29 @@ mod tests {
         assert_eq!(&output[12..15], &[1, 0b1011, 1]);
         assert_eq!(&output[15..17], &100u16.to_le_bytes());
         assert_eq!(&output[19..23], &1u32.to_le_bytes());
+
+        let extended_slots =
+            core::array::from_fn(|slot| (slot as u16 + 1, 2_500, 0x1000_0000 + slot as u32));
+        let length =
+            encode_status_page_event(&mut output, 6, 2, Some(15), 0x8001, false, &extended_slots)
+                .unwrap();
+        assert_eq!(length, HEADER_LEN + STATUS_PAGE_HEADER_LEN + 2 * 8);
+        assert_eq!(output[5], STATUS_PAGE_EVENT_KIND);
+        assert_eq!(&output[12..18], &[15, 0, 16, 14, 0x01, 0x80]);
+        assert_eq!(&output[18..20], &15u16.to_le_bytes());
+        assert_eq!(&output[22..26], &0x1000_000eu32.to_le_bytes());
+        assert!(
+            encode_status_page_event(
+                &mut output,
+                7,
+                STATUS_PAGE_COUNT as u8,
+                None,
+                0,
+                false,
+                &extended_slots,
+            )
+            .is_err()
+        );
     }
 
     #[test]
